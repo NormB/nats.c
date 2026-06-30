@@ -18000,6 +18000,35 @@ void test_GetLastError(void)
     nats_clearLastError();
 }
 
+void test_JSErrCode(void)
+{
+    // Thread-local JetStream API error-code accessor (nats_GetLastJSErrCode),
+    // the numeric counterpart to nats_GetLastError that the high-level KV/JS
+    // helpers do not return inline. Pure-logic coverage; no server required.
+
+    test("No error => JS code is 0: ");
+    nats_clearLastError();
+    testCond(nats_GetLastJSErrCode() == 0);
+
+    test("nats_setLastJSErrCode records the code (set after nats_setError): ");
+    nats_setError(NATS_ERR, "%s", "simulated JS API error");
+    nats_setLastJSErrCode(JSStreamWrongLastSequenceErr);
+    testCond(nats_GetLastJSErrCode() == JSStreamWrongLastSequenceErr);
+
+    test("A subsequent non-JS error resets the code to 0: ");
+    nats_setError(NATS_ERR, "%s", "a plain (non-JS) error");
+    testCond(nats_GetLastJSErrCode() == 0);
+
+    test("A distinct JS code is reported verbatim: ");
+    nats_setError(NATS_ERR, "%s", "ttl disabled");
+    nats_setLastJSErrCode(JSMessageTTLDisabledErr);
+    testCond(nats_GetLastJSErrCode() == JSMessageTTLDisabledErr);
+
+    test("nats_clearLastError clears the code: ");
+    nats_clearLastError();
+    testCond(nats_GetLastJSErrCode() == 0);
+}
+
 void test_StaleConnection(void)
 {
     natsStatus          s = NATS_OK;

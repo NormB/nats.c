@@ -38,6 +38,8 @@ typedef struct natsTLError
     const char  *func[MAX_FRAMES];
     int         framesCount;
     int         skipUpdate;
+    int         jerrCode;   // JetStream API error code of the most recent error
+                            // (0 if none); read via nats_GetLastJSErrCode().
 
 } natsTLError;
 
