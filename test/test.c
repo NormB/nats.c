@@ -37547,6 +37547,81 @@ void test_KeyValueLimitMarkerTTL(void)
     JS_TEARDOWN;
 }
 
+// Exercises kvConfig.AllowMsgTTLBelowMarker: on a History>1 bucket the
+// server normally raises per-key TTLs to LimitMarkerTTL at ingest (a 1s
+// TTL is served until the marker TTL, then the key rolls back to the
+// previous revision).  With the flag the TTL is honored as written.  The
+// flag needs a nats-server built with the allow_msg_ttl_below_marker
+// stream config option; stock servers reject the bucket creation with an
+// unknown-field config error, in which case everything past the create
+// is skipped (same spirit as the version gate in JS_SETUP).
+void test_KeyValueAllowMsgTTLBelowMarker(void)
+{
+    natsStatus      s;
+    kvStore         *kv = NULL;
+    kvEntry         *e  = NULL;
+    jsStreamInfo    *si = NULL;
+    kvConfig        kvc;
+    uint64_t        rev1 = 0;
+    uint64_t        rev2 = 0;
+    bool            supported = false;
+
+    JS_SETUP(2, 11, 0);
+
+    test("Create KV (History=3, marker TTL 2s, TTL below marker): ");
+    kvConfig_Init(&kvc);
+    kvc.Bucket = "KVBM";
+    kvc.History = 3;
+    kvc.LimitMarkerTTL = (int64_t)2 * 1000 * 1000 * 1000;
+    kvc.AllowMsgTTLBelowMarker = true;
+    s = js_CreateKeyValue(&kv, js, &kvc);
+    // A stock nats-server rejects the unknown stream config field.
+    supported = (s == NATS_OK);
+    testCond((s == NATS_OK) || (s == NATS_ERR));
+
+    if (supported)
+    {
+        test("Stream config round-trips the flag: ");
+        s = js_GetStreamInfo(&si, js, "KV_KVBM", NULL, NULL);
+        testCond((s == NATS_OK) && (si != NULL)
+                 && si->Config->AllowMsgTTLBelowMarker);
+
+        test("Seed without TTL: ");
+        s = kvStore_CreateString(&rev1, kv, "k", "seed");
+        testCond(s == NATS_OK);
+
+        test("Update with 1s TTL (below the 2s marker TTL): ");
+        s = kvStore_UpdateStringWithTTL(&rev2, kv, "k", "row", rev1, 1000);
+        testCond(s == NATS_OK);
+
+        test("TTL'd revision still served before expiry: ");
+        s = kvStore_Get(&e, kv, "k");
+        testCond((s == NATS_OK) && (e != NULL)
+                 && (kvEntry_Revision(e) == rev2));
+        kvEntry_Destroy(e);
+        e = NULL;
+
+        // Without the flag the 1s TTL would be raised to the 2s marker
+        // TTL and the head would still be rev2 at t=1.5s.
+        test("TTL honored as written (rolls back to seed at ~1s): ");
+        nats_Sleep(1500);
+        s = kvStore_Get(&e, kv, "k");
+        testCond((s == NATS_OK) && (e != NULL)
+                 && (kvEntry_Revision(e) == rev1));
+        kvEntry_Destroy(e);
+        e = NULL;
+    }
+    else
+    {
+        printf("  (server without allow_msg_ttl_below_marker; remainder skipped)\n");
+    }
+
+    kvStore_Destroy(kv);
+    jsStreamInfo_Destroy(si);
+
+    JS_TEARDOWN;
+}
+
 // Exercises the per-key TTL write helpers (kvStore_CreateWithTTL /
 // kvStore_CreateStringWithTTL / kvStore_UpdateWithTTL / kvStore_UpdateStringWithTTL),
 // the kvConfig.LimitMarkerTTL bucket option, and kvPurgeOptions.TTL. Requires

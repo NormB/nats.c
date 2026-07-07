@@ -276,6 +276,13 @@ js_CreateKeyValue(kvStore **new_kv, jsCtx *js, kvConfig *cfg)
             sc.SubjectDeleteMarkerTTL = cfg->LimitMarkerTTL;
         }
 
+        // Opt out of the server's ingest clamp that raises per-key TTLs to
+        // LimitMarkerTTL on History>1 buckets.  Copied through even without
+        // LimitMarkerTTL so the server's own validation (the flag requires
+        // a marker TTL) surfaces instead of being silently masked here.
+        if (cfg->AllowMsgTTLBelowMarker)
+            sc.AllowMsgTTLBelowMarker = true;
+
         if (cfg->Mirror != NULL)
         {
             jsStreamSource *m = cfg->Mirror;

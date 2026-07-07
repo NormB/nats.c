@@ -668,6 +668,14 @@ typedef struct jsStreamConfig {
         /// nats-server v2.11.0 or later.
         int64_t                 SubjectDeleteMarkerTTL;
 
+        /// @brief Allows per-message TTLs shorter than SubjectDeleteMarkerTTL
+        /// on streams with MaxMsgsPerSubject != 1 (by default the server
+        /// raises such TTLs to the marker TTL at ingest). Requires a
+        /// nats-server built with the allow_msg_ttl_below_marker stream
+        /// config option; servers without it reject the stream config
+        /// (unknown field).
+        bool                    AllowMsgTTLBelowMarker;
+
         /// @brief Sets the persistence mode for the stream. Requires nats-server
         /// v2.12.0 or later.
         jsPersistModeType       PersistMode;
@@ -1606,6 +1614,16 @@ typedef struct kvConfig
         // delete/purge tombstone markers after this duration. Required for
         // kvStore_CreateWithTTL() to take effect. Requires nats-server v2.11+.
         int64_t         LimitMarkerTTL;
+
+        // Allows per-key TTLs shorter than LimitMarkerTTL on buckets with
+        // History > 1 (by default the server raises such TTLs to the marker
+        // TTL at ingest, so a 1s TTL on a history bucket is served until the
+        // marker TTL and then rolls back to the previous revision).  Only
+        // meaningful together with LimitMarkerTTL > 0.  Requires a
+        // nats-server built with the allow_msg_ttl_below_marker stream
+        // config option; servers without it reject the bucket creation
+        // (unknown field).
+        bool            AllowMsgTTLBelowMarker;
 
 } kvConfig;
 

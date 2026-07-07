@@ -790,6 +790,7 @@ js_unmarshalStreamConfig(nats_JSON *json, const char *fieldName, jsStreamConfig 
     IFOK(s, _unmarshalStreamConsumerLimits(obj, &(cfg->ConsumerLimits)));
     IFOK(s, nats_JSONGetLong(jcfg, "subject_delete_marker_ttl", &(cfg->SubjectDeleteMarkerTTL)));
     IFOK(s, nats_JSONGetBool(jcfg, "allow_msg_ttl", &(cfg->AllowMsgTTL)));
+    IFOK(s, nats_JSONGetBool(jcfg, "allow_msg_ttl_below_marker", &(cfg->AllowMsgTTLBelowMarker)));
     IFOK(s, _unmarshalPersistModeType(jcfg, &(cfg->PersistMode)));
     IFOK(s, nats_JSONGetBool(jcfg, "allow_atomic", &(cfg->AllowAtomic)));
     IFOK(s, nats_JSONGetBool(jcfg, "allow_msg_counter", &(cfg->AllowMsgCounter)));
@@ -932,6 +933,10 @@ js_marshalStreamConfig(natsBuffer **new_buf, jsStreamConfig *cfg)
         s = natsBuf_Append(buf, ",\"allow_msg_ttl\":true", -1);
     if ((s == NATS_OK) && cfg->SubjectDeleteMarkerTTL > 0)
         s = nats_marshalLong(buf, true, "subject_delete_marker_ttl", cfg->SubjectDeleteMarkerTTL);
+    // Marshaled only when set: servers without the option reject the
+    // unknown field, so it must never appear unless explicitly requested.
+    if ((s == NATS_OK) && cfg->AllowMsgTTLBelowMarker)
+        s = natsBuf_Append(buf, ",\"allow_msg_ttl_below_marker\":true", -1);
     if ((s == NATS_OK) && cfg->AllowMsgCounter)
         s = natsBuf_Append(buf, ",\"allow_msg_counter\":true", -1);
     if ((s == NATS_OK) && cfg->AllowMsgSchedules)
