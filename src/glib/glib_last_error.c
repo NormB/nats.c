@@ -108,6 +108,7 @@ nats_setErrorReal(const char *fileName, const char *funcName, int line, natsStat
 
     errTL->sts = errSts;
     errTL->framesCount = -1;
+    errTL->jerrCode = 0;   // reset; JS API error paths re-set it via nats_setLastJSErrCode()
 
     tmp[0] = '\0';
 
@@ -206,6 +207,36 @@ nats_clearLastError(void)
     errTL->sts         = NATS_OK;
     errTL->text[0]     = '\0';
     errTL->framesCount = -1;
+    errTL->jerrCode    = 0;
+}
+
+// Store the JetStream API error code for the most recent error on this thread.
+// Called from the JS API error paths right after nats_setError(), so it survives
+// the reset that nats_setError() performs.  Internal (see err.h).
+void
+nats_setLastJSErrCode(int jerrCode)
+{
+    natsTLError *errTL  = _getThreadError();
+
+    if ((errTL == NULL) || errTL->skipUpdate)
+        return;
+
+    errTL->jerrCode = jerrCode;
+}
+
+// Public: the JetStream API error code (jsErrCode, e.g. JSStreamWrongLastSequenceErr)
+// of the most recent error on this thread, or 0 if the last error carried none.
+// Mirrors nats_GetLastError() for the numeric JS code that the high-level KV/JS
+// helpers do not return inline.
+int
+nats_GetLastJSErrCode(void)
+{
+    natsTLError *errTL  = _getThreadError();
+
+    if (errTL == NULL)
+        return 0;
+
+    return errTL->jerrCode;
 }
 
 void

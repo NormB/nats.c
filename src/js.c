@@ -622,6 +622,11 @@ js_PublishMsg(jsPubAck **new_puback,jsCtx *js, natsMsg *msg,
              if (errCode != NULL)
                 *errCode = (int) ar.Error.ErrCode;
             s = nats_setError(NATS_ERR, "%s", ar.Error.Description);
+            // Record the numeric JS code on the thread so callers of helpers
+            // that don't take a jsErrCode* (e.g. kvStore_*WithTTL) can read it
+            // via nats_GetLastJSErrCode(). Must follow nats_setError(), which
+            // resets the stored code.
+            nats_setLastJSErrCode((int) ar.Error.ErrCode);
         }
         else if (new_puback != NULL)
         {

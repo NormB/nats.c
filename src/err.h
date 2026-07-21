@@ -52,4 +52,10 @@ nats_updateErrTxt(const char *fileName, const char *funcName, int line, const ch
 void
 nats_setErrStatusAndTxt(natsStatus err, const char *errTxt);
 
+// Record the JetStream API error code for the calling thread's most recent
+// error. Call right after nats_setError() on a JS API error path (nats_setError
+// resets the stored code to 0). Read back publicly via nats_GetLastJSErrCode().
+void
+nats_setLastJSErrCode(int jerrCode);
+
 #endif /* ERR_H_ */

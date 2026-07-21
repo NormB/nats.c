@@ -2757,6 +2757,23 @@ nats_Sleep(int64_t sleepTime);
 NATS_EXTERN const char*
 nats_GetLastError(natsStatus *status);
 
+/** \brief Returns the JetStream API error code of the calling thread's last error.
+ *
+ * When a JetStream operation fails with a server-side API error, the numeric
+ * #jsErrCode (e.g. #JSStreamWrongLastSequenceErr, #JSMessageTTLDisabledErr) is
+ * recorded on the calling thread alongside the error text. This returns that
+ * code for the most recent error, or 0 if the last error carried no JS code
+ * (e.g. a client-side or connection error, or a successful call).
+ *
+ * This is the numeric counterpart to #nats_GetLastError, useful for the
+ * high-level helpers (e.g. #kvStore_UpdateWithTTL) that do not expose a
+ * `jsErrCode*` out-parameter inline.
+ *
+ * @return the thread-local JetStream API error code, or 0 if none.
+ */
+NATS_EXTERN int
+nats_GetLastJSErrCode(void);
+
 /** \brief Returns the calling thread's last known error stack.
  *
  * Copies the calling thread's last known error stack into the provided buffer.
