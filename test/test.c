@@ -133,6 +133,9 @@ struct threadArg
     natsConnection   *nc;
     jsCtx            *js;
     natsBuffer       *buf;
+    kvEntry          *kve;
+    natsMsg          *msg;
+    jsErrCode        jerr;
 
 #if defined(NATS_HAS_STREAMING)
     stanConnection   *sc;
@@ -4936,18 +4939,22 @@ void test_natsMsg(void)
 {
     natsMsg     *msg = NULL;
     natsStatus  s    = NATS_OK;
+    const char  *pay = "hello";
 
     test("Check invalid subj (NULL): ");
     s = natsMsg_Create(&msg, NULL, "reply", "data", 4);
     testCond((msg == NULL) && (s == NATS_INVALID_ARG));
+    nats_clearLastError();
 
     test("Check invalid subj (empty): ");
     s = natsMsg_Create(&msg, "", "reply", "data", 4);
     testCond((msg == NULL) && (s == NATS_INVALID_ARG));
+    nats_clearLastError();
 
     test("Check invalid reply (empty): ");
     s = natsMsg_Create(&msg, "foo", "", "data", 4);
     testCond((msg == NULL) && (s == NATS_INVALID_ARG));
+    nats_clearLastError();
 
     test("GetSubject with NULL msg: ");
     testCond(natsMsg_GetSubject(NULL) == NULL);
@@ -4964,6 +4971,43 @@ void test_natsMsg(void)
     test("Create ok: ");
     s = natsMsg_Create(&msg, "foo", "reply", "data", 4);
     testCond((s == NATS_OK) && (msg != NULL));
+
+    natsMsg_Destroy(msg);
+    msg = NULL;
+
+    test("Create with no data: ");
+    s = natsMsg_Create(&msg, "foo", NULL, NULL, 0);
+    // msg->data actually points to somewhere inside the message structure,
+    // however, natsMsg_GetData should return NULL.
+    testCond((s == NATS_OK) && (msg != NULL) && (msg->data != NULL) && (msg->dataLen == 0)
+                && (natsMsg_GetData(msg) == NULL) && (natsMsg_GetDataLength(msg) == 0));
+
+    test("Set NULL data with non-zero len: ");
+    s = natsMsg_SetData(msg, NULL, 5);
+    testCond(s == NATS_INVALID_ARG);
+    nats_clearLastError();
+
+    test("Set negative len: ");
+    s = natsMsg_SetData(msg, (const void*) "hi", -1);
+    testCond(s == NATS_INVALID_ARG);
+    nats_clearLastError();
+
+    test("Set data: ");
+    s = natsMsg_SetData(NULL, (const void*) "hello", 5);
+    testCond(s == NATS_INVALID_ARG);
+    nats_clearLastError();
+
+    test("Set NULL/0 is ok: ");
+    s = natsMsg_SetData(msg, NULL, 0);
+    testCond((s == NATS_OK) && (msg->data == NULL) && (msg->dataLen == 0));
+
+    test("Set data: ");
+    s = natsMsg_SetData(msg, (const void*) pay, 5);
+    testCond((s == NATS_OK) && (msg->data == pay) && (msg->dataLen == 5));
+
+    test("Set NULL/0 is ok: ");
+    s = natsMsg_SetData(msg, NULL, 0);
+    testCond((s == NATS_OK) && (msg->data == NULL) && (msg->dataLen == 0));
 
     natsMsg_Destroy(msg);
 }
@@ -5949,6 +5993,55 @@ void test_natsMsgHeaderAPIs(void)
     testCond((s == NATS_NOT_FOUND) && (val == NULL));
 
     natsMsg_Destroy(msg);
+    msg = NULL;
+
+    test("Encoded length with NULL msg: ");
+    testCond(natsMsgHeader_EncodedLength(msg) == 0);
+
+    test("Create empty msg: ");
+    s = natsMsg_Create(&msg, "headers", NULL, NULL, 0);
+    testCond(s == NATS_OK);
+
+    test("Encoded length with empty msg: ");
+    testCond(natsMsgHeader_EncodedLength(msg) == 0);
+
+    test("Set a header: ");
+    s = natsMsgHeader_Set(msg, "my-key", "my-value");
+    testCond(s == NATS_OK);
+
+    test("Encoded length: ");
+    // Should be: "NATS/1.0\r\nmy-key: my-value\r\n\r\n", which means
+    // 10+6+2+8+2+2=30
+    testCond(natsMsgHeader_EncodedLength(msg) == 30);
+
+    test("Add key: ");
+    s = natsMsgHeader_Set(msg, "my-key2", "my-value2");
+    testCond(s == NATS_OK);
+
+    test("Encoded length: ");
+    // Should be: "NATS/1.0\r\nmy-key: my-value\r\nmy-key2: my-value2\r\n\r\n", which means
+    // 10+6+2+8+2+7+2+9+2+2=50
+    testCond(natsMsgHeader_EncodedLength(msg) == 50);
+
+    test("Delete first: ");
+    s = natsMsgHeader_Delete(msg, "my-key");
+    testCond(s == NATS_OK);
+
+    test("Encoded length: ");
+    // Should be: "NATS/1.0\r\nmy-key2: my-value2\r\n\r\n", which means
+    // 10+7+2+9+2+2=32
+    testCond(natsMsgHeader_EncodedLength(msg) == 32);
+
+    test("Add to existing: ");
+    s = natsMsgHeader_Add(msg, "my-key2", "my-value22");
+    testCond(s == NATS_OK);
+
+    test("Encoded length: ");
+    // Should be: "NATS/1.0\r\nmy-key2: my-value2\r\nmy-key2: my-value22\r\n\r\n", which means
+    // 10+7+2+9+2+7+2+10+2+2=53
+    testCond(natsMsgHeader_EncodedLength(msg) == 53);
+
+    natsMsg_Destroy(msg);
 }
 
 void test_natsMsgIsJSCtrl(void)
@@ -6421,6 +6514,60 @@ _proxyConnectCb(natsSock *fd, char *host, int port, void *closure)
     return s;
 }
 
+// Returns a plain blocking socket, without going through any of the natsSock_*
+// helpers. This is what a callback that performs its own connect (say an HTTP
+// CONNECT tunnel to a proxy) hands back, and the library is responsible for
+// applying the socket setup to it.
+static natsStatus
+_plainSocketProxyConnectCb(natsSock *fd, char *host, int port, void *closure)
+{
+    struct threadArg    *arg      = (struct threadArg*) closure;
+    struct addrinfo     *servinfo = NULL;
+    struct addrinfo     hints;
+    natsStatus          s         = NATS_OK;
+    natsSock            sock      = NATS_SOCK_INVALID;
+    char                sport[6];
+    int                 res;
+
+    natsMutex_Lock(arg->m);
+    arg->sum++;
+    natsMutex_Unlock(arg->m);
+
+    snprintf(sport, sizeof(sport), "%d", port);
+
+    memset(&hints, 0, sizeof(hints));
+
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    if ((res = getaddrinfo(host, sport, &hints, &servinfo)) != 0)
+        s = NATS_SYS_ERROR;
+
+    if (s == NATS_OK)
+    {
+        sock = socket(servinfo->ai_family, servinfo->ai_socktype,
+                      servinfo->ai_protocol);
+        if (sock == NATS_SOCK_INVALID)
+            s = NATS_SYS_ERROR;
+    }
+    if ((s == NATS_OK)
+        && (connect(sock, servinfo->ai_addr, (natsSockLen) servinfo->ai_addrlen) != 0))
+    {
+        s = NATS_SYS_ERROR;
+    }
+
+    if (servinfo != NULL)
+        freeaddrinfo(servinfo);
+
+    if (s == NATS_OK)
+        *fd = sock;
+    else if (sock != NATS_SOCK_INVALID)
+        natsSock_Close(sock);
+
+    return s;
+}
+
 void test_ProxyConnectCb(void)
 {
     natsStatus          s;
@@ -6472,6 +6619,37 @@ void test_ProxyConnectCb(void)
     s = (args.sum == 1 ? NATS_OK : NATS_ERR);
     args.sum = 0;
     natsMutex_Unlock(args.m);
+    testCond(s == NATS_OK);
+
+    natsConnection_Destroy(nc);
+    nc = NULL;
+
+    test("Set connectCb that returns a plain socket: ");
+    s = natsOptions_SetProxyConnHandler(opts, _plainSocketProxyConnectCb, (void*) &args);
+    testCond(s == NATS_OK);
+
+    test("Connect with connectCb returning a plain socket: ");
+    s = natsConnection_Connect(&nc, opts);
+    testCond(s == NATS_OK);
+
+    // The socket the callback returned had no options set. Check that the
+    // library applied its own setup to it, as it does on the regular path.
+    test("Socket setup applied by the library: ");
+    {
+        int         nodelay = 0;
+        natsSockLen len     = (natsSockLen) sizeof(nodelay);
+
+        s = NATS_OK;
+        if (getsockopt(nc->sockCtx.fd, IPPROTO_TCP, TCP_NODELAY,
+                       (char*) &nodelay, &len) != 0)
+        {
+            s = NATS_SYS_ERROR;
+        }
+        else if (nodelay == 0)
+        {
+            s = NATS_ERR;
+        }
+    }
     testCond(s == NATS_OK);
 
     natsConnection_Destroy(nc);
@@ -11663,6 +11841,11 @@ void test_PublishMsg(void)
     natsConnection      *nc       = NULL;
     natsSubscription    *sub      = NULL;
     natsPid             serverPid = NATS_INVALID_PID;
+    natsMsg             *msg      = NULL;
+    natsMsg             *rmsg     = NULL;
+    int                 hdr       = 0;
+    char conf[256];
+    char cmdLine[1024];
     struct threadArg    arg;
 
     s = _createDefaultThreadArgsForCbTests(&arg);
@@ -11684,12 +11867,12 @@ void test_PublishMsg(void)
     if (s == NATS_OK)
     {
         const char  data[] = {104, 101, 108, 108, 111, 33};
-        natsMsg     *msg   = NULL;
 
         s = natsMsg_Create(&msg, "foo", NULL, data, sizeof(data));
         IFOK(s, natsConnection_PublishMsg(nc, msg));
 
         natsMsg_Destroy(msg);
+        msg = NULL;
     }
     IFOK(s, natsConnection_Flush(nc));
 
@@ -11703,11 +11886,105 @@ void test_PublishMsg(void)
     testCond(s == NATS_OK);
 
     natsSubscription_Destroy(sub);
+    sub = NULL;
+
+    test("Create sync sub: ");
+    s = natsConnection_SubscribeSync(&sub, nc, "setdata");
+    testCond(s == NATS_OK);
+
+    test("Create msg: ");
+    s = natsMsg_Create(&msg, "setdata", NULL, "willbereplaced", 14);
+    testCond((s == NATS_OK) && (msg != NULL));
+
+    test("Set data: ");
+    s = natsMsg_SetData(msg, (const void*) "hello", 5);
+    testCond(s == NATS_OK);
+
+    test("Publish: ");
+    s = natsConnection_PublishMsg(nc, msg);
+    testCond(s == NATS_OK);
+
+    test("Destroy published msg: ");
+    natsMsg_Destroy(msg);
+    msg = NULL;
+    testCond(true);
+
+    test("Receive: ");
+    s = natsSubscription_NextMsg(&msg, sub, 1000);
+    testCond((s == NATS_OK) && (msg != NULL));
+
+    test("Check content: ");
+    testCond((natsMsg_GetDataLength(msg) == 5) &&
+                (strncmp(natsMsg_GetData(msg), "hello", 5) == 0));
+
+    natsMsg_Destroy(msg);
+    natsSubscription_Destroy(sub);
+    sub = NULL;
     natsConnection_Destroy(nc);
+    nc = NULL;
 
     _stopServer(serverPid);
+    serverPid = NATS_INVALID_PID;
 
     _destroyDefaultThreadArgs(&arg);
+
+    test("Start server with max_payload: ");
+    _createConfFile(conf, sizeof(conf), "max_payload: 40\n");
+    snprintf(cmdLine, sizeof(cmdLine), "-c %s", conf);
+    serverPid = _startServer("nats://127.0.0.1:4222", cmdLine, true);
+    CHECK_SERVER_STARTED(serverPid);
+    testCond(true);
+
+    test("Connect and subscribe: ");
+    s = natsConnection_ConnectTo(&nc, NATS_DEFAULT_URL);
+    IFOK(s, natsConnection_SubscribeSync(&sub, nc, "setdata"));
+    testCond((s == NATS_OK) && (nc != NULL) && (sub != NULL));
+
+    test("Create msg: ");
+    s = natsMsg_Create(&msg, "setdata", NULL, NULL, 0);
+    testCond((s == NATS_OK) && (msg != NULL));
+
+    test("Set header: ");
+    s = natsMsgHeader_Set(msg, "my-key", "my-value");
+    testCond(s == NATS_OK);
+
+    test("Headers Encoded length: ");
+    // Should be: "NATS/1.0\r\nmy-key: my-value\r\n\r\n", which means
+    // 10+6+2+8+2+2=30
+    hdr = natsMsgHeader_EncodedLength(msg);
+    testCond(hdr == 30);
+
+    test("Set data at 40-30=10: ");
+    s = natsMsg_SetData(msg, (const void*) "hellohello", 10);
+    testCond(s == NATS_OK);
+
+    test("Publish ok: ");
+    s = natsConnection_PublishMsg(nc, msg);
+    testCond(s == NATS_OK);
+
+    test("Check received: ");
+    s = natsSubscription_NextMsg(&rmsg, sub, 1000);
+    testCond((s == NATS_OK) && (rmsg != NULL));
+
+    test("Check content: ");
+    testCond((natsMsg_GetDataLength(rmsg) == 10) &&
+                (strncmp(natsMsg_GetData(rmsg), "hellohello", 10) == 0));
+    natsMsg_Destroy(rmsg);
+    rmsg = NULL;
+
+    test("Set data too long: ");
+    s = natsMsg_SetData(msg, (const void*) "hellohello!", 11);
+    testCond(s == NATS_OK);
+
+    test("Publish fails: ");
+    s = natsConnection_PublishMsg(nc, msg);
+    testCond(s == NATS_MAX_PAYLOAD);
+    nats_clearLastError();
+
+    natsMsg_Destroy(msg);
+    natsSubscription_Destroy(sub);
+    natsConnection_Destroy(nc);
+    _stopServer(serverPid);
 }
 
 void test_InvalidSubsArgs(void)
@@ -34283,14 +34560,14 @@ void test_JetStreamConvertDirectMsg(void)
     s = natsMsg_Create(&msg, "inbox", NULL, NULL, 0);
     IFOK(s, natsMsgHeader_Set(msg, STATUS_HDR, HDR_STATUS_TIMEOUT_408));
     IFOK(s, natsMsgHeader_Set(msg, DESCRIPTION_HDR, "Bad Request"));
-    IFOK(s, js_directGetMsgToJSMsg("test", msg));
+    IFOK(s, js_directGetMsgToJSMsg(msg));
     testCond((s == NATS_ERR) && (strstr(nats_GetLastError(NULL), "Bad Request") != NULL));
     nats_clearLastError();
 
     test("Not found: ");
     s = natsMsgHeader_Set(msg, STATUS_HDR, HDR_STATUS_NOT_FOUND_404);
     IFOK(s, natsMsgHeader_Set(msg, DESCRIPTION_HDR, "Message Not Found"));
-    IFOK(s, js_directGetMsgToJSMsg("test", msg));
+    IFOK(s, js_directGetMsgToJSMsg(msg));
     testCond((s == NATS_NOT_FOUND) && (strstr(nats_GetLastError(NULL), natsStatus_GetText(NATS_NOT_FOUND)) != NULL));
     nats_clearLastError();
     natsMsg_Destroy(msg);
@@ -34298,55 +34575,55 @@ void test_JetStreamConvertDirectMsg(void)
 
     test("Msg has no header: ");
     s = natsMsg_Create(&msg, "inbox", NULL, "1", 1);
-    IFOK(s, js_directGetMsgToJSMsg("test", msg));
+    IFOK(s, js_directGetMsgToJSMsg(msg));
     testCond((s == NATS_ERR) && (strstr(nats_GetLastError(NULL), "should have headers") != NULL));
     nats_clearLastError();
 
     test("Missing stream: ");
     s = natsMsgHeader_Set(msg, "some", "header");
-    IFOK(s, js_directGetMsgToJSMsg("test", msg));
+    IFOK(s, js_directGetMsgToJSMsg(msg));
     testCond((s == NATS_ERR) && (strstr(nats_GetLastError(NULL), "missing stream") != NULL));
     nats_clearLastError();
 
     test("Missing sequence: ");
     s = natsMsgHeader_Set(msg, JSStream, "test");
-    IFOK(s, js_directGetMsgToJSMsg("test", msg));
+    IFOK(s, js_directGetMsgToJSMsg(msg));
     testCond((s == NATS_ERR) && (strstr(nats_GetLastError(NULL), "invalid sequence") != NULL));
     nats_clearLastError();
 
     test("Invalid sequence: ");
     s = natsMsgHeader_Set(msg, JSSequence, "abc");
-    IFOK(s, js_directGetMsgToJSMsg("test", msg));
+    IFOK(s, js_directGetMsgToJSMsg(msg));
     testCond((s == NATS_ERR) && (strstr(nats_GetLastError(NULL), "invalid sequence 'abc'") != NULL));
     nats_clearLastError();
 
     test("Missing timestamp: ");
     s = natsMsgHeader_Set(msg, JSSequence, "1");
-    IFOK(s, js_directGetMsgToJSMsg("test", msg));
+    IFOK(s, js_directGetMsgToJSMsg(msg));
     testCond((s == NATS_ERR) && (strstr(nats_GetLastError(NULL), "missing or invalid timestamp") != NULL));
     nats_clearLastError();
 
     test("Invalid timestamp: ");
     s = natsMsgHeader_Set(msg, JSTimeStamp, "aaaaaaaaa bbbbbbbbbbbb cccccccccc ddddddddddd eeeeeeeeee ffffff");
-    IFOK(s, js_directGetMsgToJSMsg("test", msg));
+    IFOK(s, js_directGetMsgToJSMsg(msg));
     testCond((s == NATS_ERR) && (strstr(nats_GetLastError(NULL), "missing or invalid timestamp 'aaaaaaaaa bbbbbbbbbbbb cccccccccc ddddddddddd eeeeeeeeee ffffff'") != NULL));
     nats_clearLastError();
 
     test("Missing subject: ");
     s = natsMsgHeader_Set(msg, JSTimeStamp, "2006-01-02T15:04:05Z");
-    IFOK(s, js_directGetMsgToJSMsg("test", msg));
+    IFOK(s, js_directGetMsgToJSMsg(msg));
     testCond((s == NATS_ERR) && (strstr(nats_GetLastError(NULL), "missing or invalid subject") != NULL));
     nats_clearLastError();
 
     test("Invalid subject: ");
     s = natsMsgHeader_Set(msg, JSSubject, "");
-    IFOK(s, js_directGetMsgToJSMsg("test", msg));
+    IFOK(s, js_directGetMsgToJSMsg(msg));
     testCond((s == NATS_ERR) && (strstr(nats_GetLastError(NULL), "missing or invalid subject ''") != NULL));
     nats_clearLastError();
 
     test("Valid msg: ");
     s = natsMsgHeader_Set(msg, JSSubject, "foo");
-    IFOK(s, js_directGetMsgToJSMsg("test", msg));
+    IFOK(s, js_directGetMsgToJSMsg(msg));
     testCond((s == NATS_OK)
                 && (strcmp(natsMsg_GetSubject(msg), "foo") == 0)
                 && (natsMsg_GetSequence(msg) == 1)
@@ -34355,6 +34632,296 @@ void test_JetStreamConvertDirectMsg(void)
                 && (strcmp(val, "header") == 0));
 
     natsMsg_Destroy(msg);
+}
+
+// Returns NATS_TIMEOUT if the callback was not invoked, otherwise NATS_OK,
+// the status the callback was invoked with being in `arg->status`.
+static natsStatus
+_waitForAsyncGet(struct threadArg *arg, int64_t timeout)
+{
+    natsStatus s = NATS_OK;
+
+    natsMutex_Lock(arg->m);
+    while ((s != NATS_TIMEOUT) && !arg->msgReceived)
+        s = natsCondition_TimedWait(arg->c, arg->m, timeout);
+    if (s == NATS_OK)
+        arg->msgReceived = false;
+    natsMutex_Unlock(arg->m);
+
+    return s;
+}
+
+static void
+_getMsgAsyncCb(natsMsg *msg, natsStatus s, jsErrCode jerr, void *closure)
+{
+    struct threadArg *arg = (struct threadArg*) closure;
+
+    natsMutex_Lock(arg->m);
+    arg->msg         = msg;
+    arg->status      = s;
+    arg->jerr        = jerr;
+    arg->msgReceived = true;
+    arg->sum++;
+    natsCondition_Broadcast(arg->c);
+    natsMutex_Unlock(arg->m);
+}
+
+void test_JetStreamGetMsgAsync(void)
+{
+    natsStatus          s;
+    natsSubscription    *sub  = NULL;
+    jsCtx               *js2  = NULL;
+    jsStreamConfig      cfg;
+    jsOptions           o;
+    jsErrCode           jerr = 0;
+    struct threadArg    arg;
+
+    JS_SETUP(2, 3, 1);
+
+    s = _createDefaultThreadArgsForCbTests(&arg);
+    if (s != NATS_OK)
+        FAIL("Unable to setup test");
+
+    test("Create stream: ");
+    jsStreamConfig_Init(&cfg);
+    cfg.Name = "GET_MSG_ASYNC";
+    cfg.Subjects = (const char*[1]){"foo.*"};
+    cfg.SubjectsLen = 1;
+    cfg.Storage = js_MemoryStorage;
+    s = js_AddStream(NULL, js, &cfg, NULL, &jerr);
+    testCond((s == NATS_OK) && (jerr == 0));
+
+    test("Populate: ");
+    s = js_Publish(NULL, js, "foo.bar", "msg1", 4, NULL, NULL);
+    IFOK(s, js_Publish(NULL, js, "foo.baz", "msg2", 4, NULL, NULL));
+    IFOK(s, js_Publish(NULL, js, "foo.bar", "msg3", 4, NULL, NULL));
+    testCond(s == NATS_OK);
+
+    test("Bad args: ");
+    s = js_getMsgAsync(NULL, "GET_MSG_ASYNC", 1, NULL, NULL, _getMsgAsyncCb, (void*) &arg);
+    if (s == NATS_INVALID_ARG)
+        s = js_getMsgAsync(js, "GET_MSG_ASYNC", 1, NULL, NULL, NULL, (void*) &arg);
+    if (s == NATS_INVALID_ARG)
+        s = js_getMsgAsync(js, NULL, 1, NULL, NULL, _getMsgAsyncCb, (void*) &arg);
+    if (s == NATS_INVALID_ARG)
+        s = js_getMsgAsync(js, "GET_MSG_ASYNC", 0, NULL, NULL, _getMsgAsyncCb, (void*) &arg);
+    testCond(s == NATS_INVALID_ARG);
+    nats_clearLastError();
+
+    test("Get by sequence: ");
+    s = js_getMsgAsync(js, "GET_MSG_ASYNC", 2, NULL, NULL, _getMsgAsyncCb, (void*) &arg);
+    IFOK(s, _waitForAsyncGet(&arg, 2000));
+    testCond((s == NATS_OK) && (arg.status == NATS_OK) && (arg.msg != NULL)
+                && (strcmp(natsMsg_GetSubject(arg.msg), "foo.baz") == 0)
+                && (natsMsg_GetSequence(arg.msg) == 2)
+                && (natsMsg_GetDataLength(arg.msg) == 4)
+                && (strncmp(natsMsg_GetData(arg.msg), "msg2", 4) == 0));
+    natsMsg_Destroy(arg.msg);
+    arg.msg = NULL;
+
+    test("Get last by subject: ");
+    s = js_getMsgAsync(js, "GET_MSG_ASYNC", 0, "foo.bar", NULL, _getMsgAsyncCb, (void*) &arg);
+    IFOK(s, _waitForAsyncGet(&arg, 2000));
+    testCond((s == NATS_OK) && (arg.status == NATS_OK) && (arg.msg != NULL)
+                && (natsMsg_GetSequence(arg.msg) == 3)
+                && (strncmp(natsMsg_GetData(arg.msg), "msg3", 4) == 0));
+    natsMsg_Destroy(arg.msg);
+    arg.msg = NULL;
+
+    test("Message not found: ");
+    s = js_getMsgAsync(js, "GET_MSG_ASYNC", 100, NULL, NULL, _getMsgAsyncCb, (void*) &arg);
+    IFOK(s, _waitForAsyncGet(&arg, 2000));
+    testCond((s == NATS_OK) && (arg.status == NATS_NOT_FOUND) && (arg.msg == NULL)
+                && (arg.jerr == JSNoMessageFoundErr));
+    nats_clearLastError();
+
+    test("No responders: ");
+    jsOptions_Init(&o);
+    o.Prefix = "$JS.DOESNOTEXIST.API";
+    s = js_getMsgAsync(js, "GET_MSG_ASYNC", 1, NULL, &o, _getMsgAsyncCb, (void*) &arg);
+    IFOK(s, _waitForAsyncGet(&arg, 2000));
+    testCond((s == NATS_OK) && (arg.status == NATS_NO_RESPONDERS) && (arg.msg == NULL)
+                && (arg.jerr == JSNotEnabledErr));
+
+    // Subscribe to the API subject so that the requests sent below have a
+    // responder, but never reply to them.
+    test("Create responder that does not reply: ");
+    s = natsConnection_SubscribeSync(&sub, nc, "$JS.NOREPLY.API.>");
+    IFOK(s, natsConnection_Flush(nc));
+    testCond(s == NATS_OK);
+
+    test("Timeout: ");
+    jsOptions_Init(&o);
+    o.Prefix = "$JS.NOREPLY.API";
+    o.Wait   = 250;
+    s = js_getMsgAsync(js, "GET_MSG_ASYNC", 1, NULL, &o, _getMsgAsyncCb, (void*) &arg);
+    IFOK(s, _waitForAsyncGet(&arg, 2000));
+    testCond((s == NATS_OK) && (arg.status == NATS_TIMEOUT) && (arg.msg == NULL));
+
+    // With this option, the replies are received on the connection's response
+    // muxer and dispatched by the context's own thread, instead of being
+    // received on a subscription that is dedicated to this context.
+    test("Get with muxed replies: ");
+    jsOptions_Init(&o);
+    o.PublishAsync.MuxReplies = true;
+    s = natsConnection_JetStream(&js2, nc, &o);
+    IFOK(s, js_getMsgAsync(js2, "GET_MSG_ASYNC", 1, NULL, NULL, _getMsgAsyncCb, (void*) &arg));
+    IFOK(s, _waitForAsyncGet(&arg, 2000));
+    testCond((s == NATS_OK) && (arg.status == NATS_OK) && (arg.msg != NULL)
+                && (natsMsg_GetSequence(arg.msg) == 1)
+                && (strncmp(natsMsg_GetData(arg.msg), "msg1", 4) == 0));
+    natsMsg_Destroy(arg.msg);
+    arg.msg = NULL;
+    jsCtx_Destroy(js2);
+
+    test("Callbacks invoked once each: ");
+    nats_Sleep(300);
+    natsMutex_Lock(arg.m);
+    s = (arg.sum == 6 ? NATS_OK : NATS_ERR);
+    natsMutex_Unlock(arg.m);
+    testCond(s == NATS_OK);
+
+    test("Pending request completed when context is destroyed: ");
+    jsOptions_Init(&o);
+    o.Prefix = "$JS.NOREPLY.API";
+    o.Wait   = 10000;
+    s = js_getMsgAsync(js, "GET_MSG_ASYNC", 1, NULL, &o, _getMsgAsyncCb, (void*) &arg);
+    if (s == NATS_OK)
+    {
+        jsCtx_Destroy(js);
+        js = NULL;
+        s = _waitForAsyncGet(&arg, 2000);
+    }
+    testCond((s == NATS_OK) && (arg.status == NATS_ILLEGAL_STATE) && (arg.msg == NULL));
+
+    // The reply subscription is closed with the connection, so the timed-out
+    // request has to be completed directly by the timeout timer.
+    test("Pending request timed-out after connection is closed: ");
+    jsOptions_Init(&o);
+    o.Prefix = "$JS.NOREPLY.API";
+    o.Wait   = 250;
+    s = natsConnection_JetStream(&js2, nc, NULL);
+    IFOK(s, js_getMsgAsync(js2, "GET_MSG_ASYNC", 1, NULL, &o, _getMsgAsyncCb, (void*) &arg));
+    if (s == NATS_OK)
+    {
+        natsConnection_Close(nc);
+        s = _waitForAsyncGet(&arg, 2000);
+    }
+    testCond((s == NATS_OK) && (arg.status == NATS_TIMEOUT) && (arg.msg == NULL));
+    jsCtx_Destroy(js2);
+
+    natsSubscription_Destroy(sub);
+
+    JS_TEARDOWN;
+    _destroyDefaultThreadArgs(&arg);
+}
+
+void test_JetStreamDirectGetMsgAsync(void)
+{
+    natsStatus              s;
+    jsStreamConfig          cfg;
+    jsDirectGetMsgOptions   dgo;
+    jsErrCode               jerr = 0;
+    struct threadArg        arg;
+
+    JS_SETUP(2, 9, 0);
+
+    s = _createDefaultThreadArgsForCbTests(&arg);
+    if (s != NATS_OK)
+        FAIL("Unable to setup test");
+
+    test("Create stream: ");
+    jsStreamConfig_Init(&cfg);
+    cfg.Name = "DGM_ASYNC";
+    cfg.Subjects = (const char*[2]){"foo", "bar"};
+    cfg.SubjectsLen = 2;
+    cfg.Storage = js_MemoryStorage;
+    cfg.AllowDirect = true;
+    s = js_AddStream(NULL, js, &cfg, NULL, &jerr);
+    testCond((s == NATS_OK) && (jerr == 0));
+
+    test("Populate: ");
+    s = js_Publish(NULL, js, "foo", "msg1", 4, NULL, NULL);
+    IFOK(s, js_Publish(NULL, js, "bar", "msg2", 4, NULL, NULL));
+    IFOK(s, js_Publish(NULL, js, "foo", "msg3", 4, NULL, NULL));
+    testCond(s == NATS_OK);
+
+    test("Bad args: ");
+    jsDirectGetMsgOptions_Init(&dgo);
+    dgo.Sequence = 1;
+    s = js_directGetMsgAsync(NULL, "DGM_ASYNC", NULL, &dgo, _getMsgAsyncCb, (void*) &arg);
+    if (s == NATS_INVALID_ARG)
+        s = js_directGetMsgAsync(js, "DGM_ASYNC", NULL, NULL, _getMsgAsyncCb, (void*) &arg);
+    if (s == NATS_INVALID_ARG)
+        s = js_directGetMsgAsync(js, "DGM_ASYNC", NULL, &dgo, NULL, (void*) &arg);
+    if (s == NATS_INVALID_ARG)
+        s = js_directGetMsgAsync(js, NULL, NULL, &dgo, _getMsgAsyncCb, (void*) &arg);
+    testCond(s == NATS_INVALID_ARG);
+    nats_clearLastError();
+
+    test("Get by sequence: ");
+    jsDirectGetMsgOptions_Init(&dgo);
+    dgo.Sequence = 2;
+    s = js_directGetMsgAsync(js, "DGM_ASYNC", NULL, &dgo, _getMsgAsyncCb, (void*) &arg);
+    IFOK(s, _waitForAsyncGet(&arg, 2000));
+    testCond((s == NATS_OK) && (arg.status == NATS_OK) && (arg.msg != NULL)
+                && (strcmp(natsMsg_GetSubject(arg.msg), "bar") == 0)
+                && (natsMsg_GetSequence(arg.msg) == 2)
+                && (natsMsg_GetTime(arg.msg) != 0)
+                && (natsMsg_GetDataLength(arg.msg) == 4)
+                && (strncmp(natsMsg_GetData(arg.msg), "msg2", 4) == 0));
+    natsMsg_Destroy(arg.msg);
+    arg.msg = NULL;
+
+    test("Get last by subject: ");
+    jsDirectGetMsgOptions_Init(&dgo);
+    dgo.LastBySubject = "foo";
+    s = js_directGetMsgAsync(js, "DGM_ASYNC", NULL, &dgo, _getMsgAsyncCb, (void*) &arg);
+    IFOK(s, _waitForAsyncGet(&arg, 2000));
+    testCond((s == NATS_OK) && (arg.status == NATS_OK) && (arg.msg != NULL)
+                && (strcmp(natsMsg_GetSubject(arg.msg), "foo") == 0)
+                && (natsMsg_GetSequence(arg.msg) == 3)
+                && (strncmp(natsMsg_GetData(arg.msg), "msg3", 4) == 0));
+    natsMsg_Destroy(arg.msg);
+    arg.msg = NULL;
+
+    test("Get next by subject: ");
+    jsDirectGetMsgOptions_Init(&dgo);
+    dgo.Sequence = 2;
+    dgo.NextBySubject = "foo";
+    s = js_directGetMsgAsync(js, "DGM_ASYNC", NULL, &dgo, _getMsgAsyncCb, (void*) &arg);
+    IFOK(s, _waitForAsyncGet(&arg, 2000));
+    testCond((s == NATS_OK) && (arg.status == NATS_OK) && (arg.msg != NULL)
+                && (strcmp(natsMsg_GetSubject(arg.msg), "foo") == 0)
+                && (natsMsg_GetSequence(arg.msg) == 3));
+    natsMsg_Destroy(arg.msg);
+    arg.msg = NULL;
+
+    test("Message not found: ");
+    jsDirectGetMsgOptions_Init(&dgo);
+    dgo.Sequence = 100;
+    s = js_directGetMsgAsync(js, "DGM_ASYNC", NULL, &dgo, _getMsgAsyncCb, (void*) &arg);
+    IFOK(s, _waitForAsyncGet(&arg, 2000));
+    testCond((s == NATS_OK) && (arg.status == NATS_NOT_FOUND) && (arg.msg == NULL));
+    nats_clearLastError();
+
+    test("Stream not found: ");
+    jsDirectGetMsgOptions_Init(&dgo);
+    dgo.LastBySubject = "foo";
+    s = js_directGetMsgAsync(js, "DOESNOTEXIST", NULL, &dgo, _getMsgAsyncCb, (void*) &arg);
+    IFOK(s, _waitForAsyncGet(&arg, 2000));
+    testCond((s == NATS_OK) && (arg.status == NATS_NO_RESPONDERS) && (arg.msg == NULL));
+    nats_clearLastError();
+
+    test("Callbacks invoked once each: ");
+    nats_Sleep(300);
+    natsMutex_Lock(arg.m);
+    s = (arg.sum == 5 ? NATS_OK : NATS_ERR);
+    natsMutex_Unlock(arg.m);
+    testCond(s == NATS_OK);
+
+    JS_TEARDOWN;
+    _destroyDefaultThreadArgs(&arg);
 }
 
 void test_JetStreamConsumerReset(void)
@@ -35949,6 +36516,350 @@ void test_KeyValueWatch(void)
     _destroyDefaultThreadArgs(&arg);
 
     JS_TEARDOWN;
+}
+
+static natsStatus
+_getNextKVEntryAsync(kvEntry **e, struct threadArg *arg, int64_t timeout)
+{
+    natsStatus  s = NATS_OK;
+
+    natsMutex_Lock(arg->m);
+    while ((s != NATS_TIMEOUT) && !arg->msgReceived)
+        s = natsCondition_TimedWait(arg->c, arg->m, timeout);
+    *e = arg->kve;
+    arg->kve = NULL;
+    arg->msgReceived = false;
+    natsMutex_Unlock(arg->m);
+
+    return s;
+}
+
+static bool
+_expectInitDoneAsync(struct threadArg *arg)
+{
+    natsStatus  s   = NATS_OK;
+    kvEntry     *e  = NULL;
+
+    test("Check init done: ");
+    s = _getNextKVEntryAsync(&e, arg, 1000);
+    return ((s == NATS_OK) && (e == NULL));
+}
+
+static bool
+_expectUpdateAsync(struct threadArg *arg, const char *key, const char *val, uint64_t rev)
+{
+    natsStatus  s;
+    kvEntry     *e = NULL;
+
+    test("Check update: ");
+    s = _getNextKVEntryAsync(&e, arg, 1000);
+    if ((s != NATS_OK) || (e == NULL))
+        return false;
+
+    if ((strcmp(kvEntry_Bucket(e), "WATCH") != 0)
+        || (strcmp(kvEntry_Key(e), key) != 0)
+        || (strcmp(kvEntry_ValueString(e), val) != 0)
+        || (kvEntry_Revision(e) != rev)
+        || (kvEntry_Created(e) == 0))
+    {
+        return false;
+    }
+    kvEntry_Destroy(e);
+    return true;
+}
+
+static bool
+_expectDeleteAsync(struct threadArg *arg, const char *key, uint64_t rev)
+{
+    natsStatus  s;
+    kvEntry     *e = NULL;
+
+    test("Check delete: ");
+    s = _getNextKVEntryAsync(&e, arg, 1000);
+    if ((s != NATS_OK) || (e == NULL))
+        return false;
+
+    if ((kvEntry_Operation(e) != kvOp_Delete)
+        || (kvEntry_Revision(e) != rev))
+    {
+        return false;
+    }
+    kvEntry_Destroy(e);
+    return true;
+}
+
+static void
+_watchCb(kvWatcher *w, kvEntry *e, natsStatus s, void *closure)
+{
+    struct threadArg *arg = (struct threadArg*) closure;
+
+    natsMutex_Lock(arg->m);
+    if ((e != NULL)
+        && (kvEntry_Operation(e) == kvOp_Put)
+        && (strcmp(kvEntry_ValueString(e), "stop") == 0))
+    {
+        kvWatcher_Stop(w);
+    }
+    arg->kve = e;
+    arg->msgReceived = true;
+    natsCondition_Broadcast(arg->c);
+    natsMutex_Unlock(arg->m);
+}
+
+void test_KeyValueWatchAsync(void)
+{
+    natsStatus          s   = NATS_OK;
+    kvStore             *kv = NULL;
+    kvWatcher           *w  = NULL;
+    kvEntry             *e  = NULL;
+    kvConfig            kvc;
+    kvWatchOptions      o;
+    struct threadArg    arg;
+
+    JS_SETUP(2, 10, 14);
+
+    s = _createDefaultThreadArgsForCbTests(&arg);
+    if (s != NATS_OK)
+        FAIL("Unable to setup test");
+
+    test("Create KV: ");
+    kvConfig_Init(&kvc);
+    kvc.Bucket = "WATCH";
+    s = js_CreateKeyValue(&kv, js, &kvc);
+    testCond(s == NATS_OK);
+
+    test("Create watcher: ");
+    kvWatchOptions_Init(&o);
+    o.Callback = _watchCb;
+    o.Closure  = (void*) &arg;
+    s = kvStore_WatchAll(&w, kv, &o);
+    testCond((s == NATS_OK) && (w != NULL));
+
+    testCond(_expectInitDoneAsync(&arg));
+
+    test("Create: ");
+    s = kvStore_CreateString(NULL, kv, "name", "derek");
+    testCond(s == NATS_OK);
+    testCond(_expectUpdateAsync(&arg, "name", "derek", 1));
+
+    test("Put: ");
+    s = kvStore_PutString(NULL, kv, "name", "rip");
+    testCond(s == NATS_OK);
+    testCond(_expectUpdateAsync(&arg, "name", "rip", 2));
+
+    test("Put: ");
+    s = kvStore_PutString(NULL, kv, "name", "ik");
+    testCond(s == NATS_OK);
+    testCond(_expectUpdateAsync(&arg, "name", "ik", 3));
+
+    test("Put: ");
+    s = kvStore_PutString(NULL, kv, "age", "22");
+    testCond(s == NATS_OK);
+    testCond(_expectUpdateAsync(&arg, "age", "22", 4));
+
+    test("Put: ");
+    s = kvStore_PutString(NULL, kv, "age", "33");
+    testCond(s == NATS_OK);
+    testCond(_expectUpdateAsync(&arg, "age", "33", 5));
+
+    test("Delete: ");
+    s = kvStore_Delete(kv, "age");
+    testCond(s == NATS_OK);
+    testCond(_expectDeleteAsync(&arg, "age", 6));
+
+    kvWatcher_Destroy(w);
+    w = NULL;
+    test("Create watcher with UpdatesOnly: ");
+    o.UpdatesOnly = true;
+    s = kvStore_Watch(&w, kv, "name", &o);
+    IFOK(s, kvStore_PutString(NULL, kv, "name", "last"));
+    testCond(s == NATS_OK);
+
+    testCond(_expectUpdateAsync(&arg, "name", "last", 7));
+
+    kvWatcher_Destroy(w);
+    w = NULL;
+    test("Create watcher with IgnoreDeletes: ");
+    o.UpdatesOnly = false;
+    o.IgnoreDeletes = true;
+    s = kvStore_Watch(&w, kv, "del", &o);
+    testCond(s == NATS_OK);
+
+    testCond(_expectInitDoneAsync(&arg));
+
+    test("Add: ");
+    s = kvStore_CreateString(NULL, kv, "del", "del");
+    testCond(s == NATS_OK);
+
+    testCond(_expectUpdateAsync(&arg, "del", "del", 8));
+
+    test("Delete: ")
+    s = kvStore_Delete(kv, "del");
+    testCond(s == NATS_OK);
+
+    test("Expect nothing: ");
+    s = _getNextKVEntryAsync(&e, &arg, 350);
+    testCond(s == NATS_TIMEOUT);
+    s = NATS_OK;
+
+    test("Next is not allowed: ");
+    s = kvWatcher_Next(&e, w, 1000);
+    testCond((s == NATS_ILLEGAL_STATE) && (e == NULL)
+                && (strstr(nats_GetLastError(NULL), kvErrNoNextIfCbSet) != NULL));
+    nats_clearLastError();
+
+    test("Stop from callback: ");
+    s = kvStore_PutString(NULL, kv, "del", "stop");
+    IFOK(s, kvStore_PutString(NULL, kv, "del", "not_received"));
+    testCond(s == NATS_OK);
+
+    testCond(_expectUpdateAsync(&arg, "del", "stop", 10));
+    test("Expect nothing: ");
+    s = _getNextKVEntryAsync(&e, &arg, 350);
+    testCond(s == NATS_TIMEOUT);
+    s = NATS_OK;
+
+    kvWatcher_Destroy(w);
+    kvStore_Destroy(kv);
+
+    JS_TEARDOWN;
+    _destroyDefaultThreadArgs(&arg);
+}
+
+static void
+_kvGetAsyncCb(kvStore *kv, kvEntry *e, natsStatus s, void *closure)
+{
+    struct threadArg *arg = (struct threadArg*) closure;
+
+    natsMutex_Lock(arg->m);
+    arg->kve         = e;
+    arg->status      = s;
+    arg->msgReceived = true;
+    arg->sum++;
+    natsCondition_Broadcast(arg->c);
+    natsMutex_Unlock(arg->m);
+}
+
+void test_KeyValueGetAsync(void)
+{
+    natsStatus          s;
+    kvStore             *kv = NULL;
+    kvEntry             *e  = NULL;
+    kvConfig            kvc;
+    const char          *bucket = NULL;
+    bool                direct = false;
+    int                 i;
+    char                txt[64];
+    struct threadArg    arg;
+
+    JS_SETUP(2, 9, 0);
+
+    s = _createDefaultThreadArgsForCbTests(&arg);
+    if (s != NATS_OK)
+        FAIL("Unable to setup test");
+
+    // Run the same checks against a bucket that supports the "direct get" API
+    // and one that does not, since those are two different code paths.
+    for (i=0; i<2; i++)
+    {
+        direct = (i == 1);
+        bucket = (direct ? "ASYNCGETDIRECT" : "ASYNCGET");
+
+        test("Create KV: ");
+        kvConfig_Init(&kvc);
+        kvc.Bucket = bucket;
+        kvc.History = 5;
+        s = js_CreateKeyValue(&kv, js, &kvc);
+        testCond(s == NATS_OK);
+
+        if (!direct)
+        {
+            // Artificially set the kv store to not use the direct get API.
+            natsMutex_Lock(kv->mu);
+            kv->useDirect = false;
+            natsMutex_Unlock(kv->mu);
+        }
+
+        snprintf(txt, sizeof(txt), "Direct get is %sused: ", (direct ? "" : "not "));
+        test(txt);
+        testCond(kv->useDirect == direct);
+
+        test("Populate: ");
+        s = kvStore_PutString(NULL, kv, "name", "derek");
+        IFOK(s, kvStore_PutString(NULL, kv, "age", "22"));
+        testCond(s == NATS_OK);
+
+        test("Bad args: ");
+        s = kvStore_GetAsync(NULL, "name", _kvGetAsyncCb, (void*) &arg);
+        if (s == NATS_INVALID_ARG)
+            s = kvStore_GetAsync(kv, "name", NULL, (void*) &arg);
+        if (s == NATS_INVALID_ARG)
+            s = kvStore_GetAsync(kv, NULL, _kvGetAsyncCb, (void*) &arg);
+        if (s == NATS_INVALID_ARG)
+            s = kvStore_GetAsync(kv, "bad key!", _kvGetAsyncCb, (void*) &arg);
+        testCond(s == NATS_INVALID_ARG);
+        nats_clearLastError();
+
+        test("Get: ");
+        s = kvStore_GetAsync(kv, "name", _kvGetAsyncCb, (void*) &arg);
+        IFOK(s, _waitForAsyncGet(&arg, 2000));
+        e = arg.kve;
+        arg.kve = NULL;
+        testCond((s == NATS_OK) && (arg.status == NATS_OK) && (e != NULL)
+                    && (strcmp(kvEntry_Bucket(e), bucket) == 0)
+                    && (strcmp(kvEntry_Key(e), "name") == 0)
+                    && (strcmp(kvEntry_ValueString(e), "derek") == 0)
+                    && (kvEntry_Revision(e) == 1)
+                    && (kvEntry_Created(e) != 0)
+                    && (kvEntry_Operation(e) == kvOp_Put));
+        kvEntry_Destroy(e);
+        e = NULL;
+
+        test("Get updated value: ");
+        s = kvStore_PutString(NULL, kv, "name", "ivan");
+        IFOK(s, kvStore_GetAsync(kv, "name", _kvGetAsyncCb, (void*) &arg));
+        IFOK(s, _waitForAsyncGet(&arg, 2000));
+        e = arg.kve;
+        arg.kve = NULL;
+        testCond((s == NATS_OK) && (arg.status == NATS_OK) && (e != NULL)
+                    && (strcmp(kvEntry_ValueString(e), "ivan") == 0)
+                    && (kvEntry_Revision(e) == 3));
+        kvEntry_Destroy(e);
+        e = NULL;
+
+        test("Get key that does not exist: ");
+        s = kvStore_GetAsync(kv, "notthere", _kvGetAsyncCb, (void*) &arg);
+        IFOK(s, _waitForAsyncGet(&arg, 2000));
+        testCond((s == NATS_OK) && (arg.status == NATS_NOT_FOUND) && (arg.kve == NULL));
+        nats_clearLastError();
+
+        test("Get deleted key: ");
+        s = kvStore_Delete(kv, "age");
+        IFOK(s, kvStore_GetAsync(kv, "age", _kvGetAsyncCb, (void*) &arg));
+        IFOK(s, _waitForAsyncGet(&arg, 2000));
+        testCond((s == NATS_OK) && (arg.status == NATS_NOT_FOUND) && (arg.kve == NULL));
+        nats_clearLastError();
+
+        test("Get purged key: ");
+        s = kvStore_Purge(kv, "name", NULL);
+        IFOK(s, kvStore_GetAsync(kv, "name", _kvGetAsyncCb, (void*) &arg));
+        IFOK(s, _waitForAsyncGet(&arg, 2000));
+        testCond((s == NATS_OK) && (arg.status == NATS_NOT_FOUND) && (arg.kve == NULL));
+        nats_clearLastError();
+
+        test("Store can be destroyed from the callback's thread: ");
+        s = kvStore_PutString(NULL, kv, "name", "derek");
+        IFOK(s, kvStore_GetAsync(kv, "name", _kvGetAsyncCb, (void*) &arg));
+        kvStore_Destroy(kv);
+        kv = NULL;
+        IFOK(s, _waitForAsyncGet(&arg, 2000));
+        testCond((s == NATS_OK) && (arg.status == NATS_OK) && (arg.kve != NULL));
+        kvEntry_Destroy(arg.kve);
+        arg.kve = NULL;
+    }
+
+    JS_TEARDOWN;
+    _destroyDefaultThreadArgs(&arg);
 }
 
 void test_KeyValueWatchMulti(void)

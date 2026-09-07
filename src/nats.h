@@ -1609,6 +1609,11 @@ typedef struct kvConfig
 
 } kvConfig;
 
+#ifndef BUILD_IN_DOXYGEN
+// Forward declaration
+typedef void (*kvWatchCb)(kvWatcher *w, kvEntry *e, natsStatus s, void *closure);
+#endif
+
 /**
  * KeyValue watcher options object.
  *
@@ -1672,6 +1677,21 @@ typedef struct kvWatchOptions
          * \warning #IncludeHistory and #UpdatesOnly options will be ignored.
          */
         uint64_t        ResumeFromRevision;
+
+        /** \brief This callback is invoked when an entry is available.
+         *
+         * If this is set, the watcher becomes asynchronous, that is, the user
+         * cannot call #kvWatcher_Next, instead the callback will automatically
+         * be invoked when an entry is available.
+         */
+        kvWatchCb       Callback;
+
+        /** \brief An optional pointer to user provided data to be passed to the #Callback.
+         *
+         * If this is non `NULL`, it will be passed to the `Callback` on each
+         * callback invocation.
+         */
+        void*           Closure;
 
 } kvWatchOptions;
 
@@ -2233,6 +2253,38 @@ typedef struct __stanSubOptions     stanSubOptions;
 typedef void (*natsMsgHandler)(
         natsConnection *nc, natsSubscription *sub, natsMsg *msg, void *closure);
 
+/** \brief Callback invoked with the entry of an asynchronous get.
+ *
+ * This is the callback that one provides to #kvStore_GetAsync(). It is invoked
+ * exactly once, either with the entry that was retrieved, or with the reason
+ * why the get did not succeed.
+ *
+ * \note If the key does not exist, or if it has been deleted or purged, the
+ * callback is invoked with a `NULL` entry and the #NATS_NOT_FOUND status,
+ * the same way that #kvStore_Get() reports it.
+ *
+ * \note If the JetStream context that the #kvStore was created from is
+ * destroyed while the get is still pending, the callback is invoked with a
+ * `NULL` entry and the #NATS_ILLEGAL_STATE status, from the thread calling
+ * #jsCtx_Destroy.
+ *
+ * \warning The user is responsible for calling #kvEntry_Destroy when no longer needed.
+ *
+ * \warning This callback is invoked from a library thread (or from the thread
+ *          destroying the JetStream context, see above), not from the thread
+ *          that called #kvStore_GetAsync(). It should not block, and use of the
+ *          `closure` object (if non `NULL`) must be thread-safe.
+ *
+ * @see kvStore_GetAsync()
+ *
+ * @param kv the #kvStore that the entry was retrieved from.
+ * @param e the #kvEntry, `NULL` if the get did not succeed.
+ * @param s a #natsStatus that indicates if the get was successful.
+ * @param closure the pointer to some user provided data, possibly `NULL`.
+ */
+typedef void (*kvGetCb)(
+        kvStore *kv, kvEntry *e, natsStatus s, void *closure);
+
 /** \brief Callback used to notify the user of asynchronous connection events.
  *
  * This callback is used for asynchronous events such as disconnected
@@ -2574,6 +2626,32 @@ typedef void (*jsPubAckHandler)(jsCtx *js, natsMsg *msg, jsPubAck *pa, jsPubAckE
  * @param closure user-defined object, possibly `NULL`.
  */
 typedef void (*natsThreadStartedHandler)(void *closure);
+
+/** \brief Callback invoked for each entry of a watcher.
+ *
+ * If the watcher is created with #kvWatchOptions.Callback, then the provided
+ * callback (and #kvWatchOptions.Closure, which can be `NULL`) will be invoked
+ * when an entry is available.
+ *
+ * \note An entry can be NULL the same way that when returned from
+ * #kvWatcher_Next to indicate the end if the initialization of the watcher.
+ * Also, the provided status may be other than #NATS_OK to indicate an issue
+ * deserializing the entry.
+ *
+ * \note If the watcher is stopped in the callback no other entry will be
+ * presented. If the watcher is called in a different thread, no error
+ * status is posted to the callback, entries are simply not dispatched.
+ *
+ * \warning The user is responsible for calling #kvEntry_Destroy when no longer needed.
+ *
+ * @param w the #kvWatcher
+ * @param e the #kvEntry, possibly `NULL` to indicate that the watcher
+ * initialization is done.
+ * @param s a #natsStatus that indicates if there was an error creating the entry.
+ * @param closure the pointer to some user provided data (#kvWatchOptions.Closure),
+ * possibly `NULL`.
+ */
+typedef void (*kvWatchCb)(kvWatcher *w, kvEntry *e, natsStatus s, void *closure);
 #endif
 
 #if defined(NATS_HAS_STREAMING)
@@ -3996,7 +4074,11 @@ natsOptions_IPResolutionOrder(natsOptions *opts, int order);
  *
  * The alternative would be to call #natsConnection_Flush(),
  * but this call requires a round-trip with the server, which is less
- * efficient than using this option.
+ * efficient than using this option. Setting the flusher wait to `0`
+ * (see #natsOptions_SetFlusherWaitMicros()) avoids the round-trip too,
+ * but the data is still handed to the flusher thread, so each publish
+ * costs a thread wake-up before it reaches the socket. With this option
+ * the publishing thread writes the data itself.
  *
  * Note that the Request() call already automatically sends the request
  * as fast as possible, there is no need to set an option for that.
@@ -4035,12 +4117,20 @@ natsOptions_SetSendAsap(natsOptions *opts, bool sendAsap);
  * benefit for sparse and request/reply style traffic without that
  * throughput cost, so `0` is rarely needed.
  *
- * \note On Windows, waits have millisecond granularity: positive values
- * are rounded up to the nearest millisecond. A value of `0` fully
- * applies on all platforms.
- *
  * \note This option has no effect if #natsOptions_SetSendAsap is set to
  * `true`, since in that case the flusher thread is not used.
+ *
+ * \note The value that yields the highest throughput depends on the
+ * machine, the message size and the publishing pattern - in our
+ * benchmarks the best value moved between 250 and 1000 microseconds
+ * across different hosts. Applications that need both maximum throughput
+ * and minimal latency should benchmark their own workload rather
+ * than assume the default is optimal.
+ *
+ * \warning On Windows, waits have millisecond granularity: positive values
+ * are rounded up to the nearest millisecond, so any value between `1` and
+ * `1000` behaves like `1000` - tuning below 1 millisecond has no effect on
+ * Windows. A value of `0` fully applies on all platforms.
  *
  * @param opts the pointer to the #natsOptions object.
  * @param flusherWaitUs the maximum accumulation wait, in microseconds.
@@ -5027,6 +5117,22 @@ natsMsg_GetSubject(const natsMsg *msg);
 NATS_EXTERN const char*
 natsMsg_GetReply(const natsMsg *msg);
 
+/** \brief Sets the message payload.
+ *
+ * Users can use this function to set the data of a message after it has
+ * been created with #natsMsg_Create.
+ *
+ * \warning The data is not copied and must remain valid and not mutated
+ * while the message has a reference to it. The user owns the data and it
+ * will not be freed when #natsMsg_Destroy is called.
+ *
+ * @param msg the pointer to the #natsMsg object.
+ * @param data the pointer to the data.
+ * @param len the length of the data that this message references.
+ */
+NATS_EXTERN natsStatus
+natsMsg_SetData(natsMsg *msg, const void *data, int len);
+
 /** \brief Returns the message payload.
  *
  * Returns the message payload, possibly `NULL`.
@@ -5037,8 +5143,13 @@ natsMsg_GetReply(const natsMsg *msg);
  * allows you to call #natsMsg_GetData() without having to copy the returned
  * data to a buffer to add the `NULL` byte at the end.
  *
- * \warning The string belongs to the message and must not be freed.
- * Copy it if needed.
+ * \warning Unless the payload was set using #natsMsg_SetData, the string belongs
+ * to the message and must not be freed. Copy it if needed.
+ *
+ * \note Returns `NULL` if the message is `NULL` or has no payload (created with
+ * `dataLen == 0`).
+ *
+ * @see natsMsg_SetData
  *
  * @param msg the pointer to the #natsMsg object.
  */
@@ -5194,6 +5305,17 @@ natsMsgHeader_Keys(natsMsg *msg, const char* **keys, int *count);
  */
 NATS_EXTERN natsStatus
 natsMsgHeader_Delete(natsMsg *msg, const char *key);
+
+/** \brief Returns the encoded length of the message headers.
+ *
+ * Returns the encoded length of the message headers.
+ *
+ * \note Returns 0 if the message is `NULL` or no headers are set.
+ *
+ * @param msg the pointer to the #natsMsg object.
+ */
+NATS_EXTERN int
+natsMsgHeader_EncodedLength(const natsMsg *msg);
 
 /** \brief Indicates if this message is a "no responders" message from the server.
  *
@@ -8487,6 +8609,32 @@ kvEntry_Destroy(kvEntry *e);
  */
 NATS_EXTERN natsStatus
 kvStore_Get(kvEntry **new_entry, kvStore *kv, const char *key);
+
+/** \brief Asynchronously returns the latest entry for the key.
+ *
+ * Starts the retrieval of the latest entry for the given key and returns
+ * immediately, without waiting for the server's response. The provided
+ * callback is invoked when the entry (or the reason why it could not be
+ * retrieved) is available.
+ *
+ * \note The callback is invoked exactly once, and only if this call returns
+ * #NATS_OK. If the key does not exist, or if it has been deleted or purged,
+ * the callback receives a `NULL` entry and the #NATS_NOT_FOUND status. If the
+ * JetStream context that the #kvStore was created from is destroyed while the
+ * get is still pending, the callback receives a `NULL` entry and the
+ * #NATS_ILLEGAL_STATE status.
+ *
+ * \warning The callback is not invoked from the calling thread, see #kvGetCb.
+ *
+ * @see kvGetCb
+ *
+ * @param kv the pointer to the #kvStore object.
+ * @param key the name of the key.
+ * @param cb the callback function to invoke when the entry is retrieved.
+ * @param cbClosure a pointer to an user defined object (can be `NULL`).
+ */
+NATS_EXTERN natsStatus
+kvStore_GetAsync(kvStore *kv, const char *key, kvGetCb cb, void *cbClosure);
 
 /** \brief Returns the entry at the specific revision for the key.
  *
