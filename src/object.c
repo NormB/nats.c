@@ -11,6 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <limits.h>
+
 #include "natsp.h"
 #include "object.h"
 #include "js.h"
@@ -1916,6 +1918,12 @@ objStore_Put(objStorePut **new_put, objStore *obs, objStoreMeta *pMeta)
         jsOptions_Init(&pubJSOpts);
         pubJSOpts.PublishAsync.ErrHandler           = _putErrHandler;
         pubJSOpts.PublishAsync.ErrHandlerClosure    = (void*) put;
+        // Inherit the store context's flow control so that a large object
+        // cannot outrun the server's ingest buffer.
+        js_lock(obs->js);
+        pubJSOpts.PublishAsync.MaxPending           = obs->js->opts.PublishAsync.MaxPending;
+        pubJSOpts.PublishAsync.StallWait            = obs->js->opts.PublishAsync.StallWait;
+        js_unlock(obs->js);
 
         s = natsConnection_JetStream(&(put->pubJS), obs->js->nc, &pubJSOpts);
         if (s == NATS_OK)
@@ -2126,6 +2134,9 @@ _get(objStoreGet **new_get, objStore *obs, int64_t start, int64_t timeout, const
 
         return NATS_UPDATE_ERR_STACK(s);
 	}
+    // Now that we know we are not a link, we need to have a digest.
+    if ((s == NATS_OK) && nats_IsStringEmpty(info->Digest))
+        s = nats_setError(NATS_ILLEGAL_STATE, "%s", obsErrBadObjectMeta);
     if (s == NATS_OK)
     {
         get = (objStoreGet*) NATS_CALLOC(1, sizeof(objStoreGet));
@@ -2328,6 +2339,7 @@ _readAll(void **new_data, int *dataLen, objStoreGet *get, bool forString, int64_
     void        *data   = NULL;
     void        *pdata  = NULL;
     int         len     = 0;
+    uint64_t    max     = (forString ? ((uint64_t) INT_MAX)-1 : (uint64_t) INT_MAX);
 
     if ((new_data == NULL) || (dataLen == NULL) || (get == NULL) || (timeout <= 0))
         return nats_setDefaultError(NATS_INVALID_ARG);
@@ -2338,6 +2350,9 @@ _readAll(void **new_data, int *dataLen, objStoreGet *get, bool forString, int64_
 
     if (get->done)
         return nats_setError(NATS_ILLEGAL_STATE, "%s", obsErrReadComplete);
+
+    if (get->remaining > max)
+        return nats_setDefaultError(NATS_INSUFFICIENT_BUFFER);
 
     len = (int) get->remaining;
     if (len == 0)

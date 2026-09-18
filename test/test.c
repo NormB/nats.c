@@ -13,6 +13,7 @@
 
 #include "test.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -11748,6 +11749,13 @@ void test_ConnectedServer(void)
 
     buffer[0] = '\0';
 
+    // The server reports its name only since v2.0.0.
+    test("Verify ConnectedServerName is not null: ")
+    s = natsConnection_GetConnectedServerName(nc, buffer, sizeof(buffer));
+    testCond((s == NATS_OK)  && (!serverVersionAtLeast(2,0,0) || (buffer[0] != '\0')));
+
+    buffer[0] = '\0';
+
     test("Verify ConnectedUrl is empty after disconnect: ")
     natsConnection_Close(nc);
     s = natsConnection_GetConnectedUrl(nc, buffer, sizeof(buffer));
@@ -11758,6 +11766,60 @@ void test_ConnectedServer(void)
     test("Verify ConnectedServerId is empty after disconnect: ")
     s = natsConnection_GetConnectedServerId(nc, buffer, sizeof(buffer));
     testCond((s == NATS_OK)  && (buffer[0] == '\0'));
+
+    buffer[0] = '\0';
+
+    test("Verify ConnectedServerName is empty after disconnect: ")
+    s = natsConnection_GetConnectedServerName(nc, buffer, sizeof(buffer));
+    testCond((s == NATS_OK)  && (buffer[0] == '\0'));
+
+    natsConnection_Destroy(nc);
+
+    _stopServer(serverPid);
+}
+
+void test_ConnectedServerName(void)
+{
+    natsStatus          s;
+    natsConnection      *nc       = NULL;
+    natsPid             serverPid = NATS_INVALID_PID;
+    char                buffer[128];
+
+    if (!serverVersionAtLeast(2,0,0))
+    {
+        char txt[200];
+
+        snprintf(txt, sizeof(txt), "Skipping since requires server version of at least 2.0.0, got %s: ", serverVersion);
+        test(txt);
+        testCond(true);
+        return;
+    }
+
+    buffer[0] = '\0';
+
+    serverPid = _startServer("nats://127.0.0.1:4222", "--name my_server_name", true);
+    CHECK_SERVER_STARTED(serverPid);
+
+    test("Verify ConnectedServerName reports the server's name: ")
+    s = natsConnection_ConnectTo(&nc, NATS_DEFAULT_URL);
+    IFOK(s, natsConnection_GetConnectedServerName(nc, buffer, sizeof(buffer)));
+    testCond((s == NATS_OK) && (strcmp(buffer, "my_server_name") == 0));
+
+    buffer[0] = '\0';
+
+    test("Verify ConnectedServerName with too small buffer: ")
+    s = natsConnection_GetConnectedServerName(nc, buffer, 4);
+    testCond(s == NATS_INSUFFICIENT_BUFFER);
+    nats_clearLastError();
+
+    buffer[0] = '\0';
+
+    test("Verify ConnectedServerName with invalid args: ")
+    s = natsConnection_GetConnectedServerName(NULL, buffer, sizeof(buffer));
+    if (s == NATS_INVALID_ARG)
+        s = natsConnection_GetConnectedServerName(nc, NULL, sizeof(buffer));
+    testCond(s == NATS_INVALID_ARG);
+    nats_clearLastError();
 
     natsConnection_Destroy(nc);
 
@@ -34674,6 +34736,7 @@ void test_JetStreamGetMsgAsync(void)
     jsStreamConfig      cfg;
     jsOptions           o;
     jsErrCode           jerr = 0;
+    jsStreamMsgGetReq   greq;
     struct threadArg    arg;
 
     JS_SETUP(2, 3, 1);
@@ -34698,18 +34761,36 @@ void test_JetStreamGetMsgAsync(void)
     testCond(s == NATS_OK);
 
     test("Bad args: ");
-    s = js_getMsgAsync(NULL, "GET_MSG_ASYNC", 1, NULL, NULL, _getMsgAsyncCb, (void*) &arg);
+    greq = (jsStreamMsgGetReq) { .seq = 1 };
+    s = js_getStreamMsgAsync(NULL, "GET_MSG_ASYNC", NULL, &greq, _getMsgAsyncCb, (void*) &arg);
     if (s == NATS_INVALID_ARG)
-        s = js_getMsgAsync(js, "GET_MSG_ASYNC", 1, NULL, NULL, NULL, (void*) &arg);
+        s = js_getStreamMsgAsync(js, "GET_MSG_ASYNC", NULL, NULL, _getMsgAsyncCb, (void*) &arg);
     if (s == NATS_INVALID_ARG)
-        s = js_getMsgAsync(js, NULL, 1, NULL, NULL, _getMsgAsyncCb, (void*) &arg);
+        s = js_getStreamMsgAsync(js, "GET_MSG_ASYNC", NULL, &greq, NULL, (void*) &arg);
     if (s == NATS_INVALID_ARG)
-        s = js_getMsgAsync(js, "GET_MSG_ASYNC", 0, NULL, NULL, _getMsgAsyncCb, (void*) &arg);
+        s = js_getStreamMsgAsync(js, NULL, NULL, &greq, _getMsgAsyncCb, (void*) &arg);
+    if (s == NATS_INVALID_ARG)
+    {
+        // The JS API get requires a sequence or a subject.
+        greq = (jsStreamMsgGetReq) { 0 };
+        s = js_getStreamMsgAsync(js, "GET_MSG_ASYNC", NULL, &greq, _getMsgAsyncCb, (void*) &arg);
+    }
+    if (s == NATS_INVALID_ARG)
+    {
+        greq = (jsStreamMsgGetReq) { .seq = 1, .lastBySubject = "foo.bar" };
+        s = js_getStreamMsgAsync(js, "GET_MSG_ASYNC", NULL, &greq, _getMsgAsyncCb, (void*) &arg);
+    }
+    if (s == NATS_INVALID_ARG)
+    {
+        greq = (jsStreamMsgGetReq) { .seq = 1, .nextBySubject = "foo.bar" };
+        s = js_getStreamMsgAsync(js, "GET_MSG_ASYNC", NULL, &greq, _getMsgAsyncCb, (void*) &arg);
+    }
     testCond(s == NATS_INVALID_ARG);
     nats_clearLastError();
 
     test("Get by sequence: ");
-    s = js_getMsgAsync(js, "GET_MSG_ASYNC", 2, NULL, NULL, _getMsgAsyncCb, (void*) &arg);
+    greq = (jsStreamMsgGetReq) { .seq = 2 };
+    s = js_getStreamMsgAsync(js, "GET_MSG_ASYNC", NULL, &greq, _getMsgAsyncCb, (void*) &arg);
     IFOK(s, _waitForAsyncGet(&arg, 2000));
     testCond((s == NATS_OK) && (arg.status == NATS_OK) && (arg.msg != NULL)
                 && (strcmp(natsMsg_GetSubject(arg.msg), "foo.baz") == 0)
@@ -34720,7 +34801,8 @@ void test_JetStreamGetMsgAsync(void)
     arg.msg = NULL;
 
     test("Get last by subject: ");
-    s = js_getMsgAsync(js, "GET_MSG_ASYNC", 0, "foo.bar", NULL, _getMsgAsyncCb, (void*) &arg);
+    greq = (jsStreamMsgGetReq) { .lastBySubject = "foo.bar" };
+    s = js_getStreamMsgAsync(js, "GET_MSG_ASYNC", NULL, &greq, _getMsgAsyncCb, (void*) &arg);
     IFOK(s, _waitForAsyncGet(&arg, 2000));
     testCond((s == NATS_OK) && (arg.status == NATS_OK) && (arg.msg != NULL)
                 && (natsMsg_GetSequence(arg.msg) == 3)
@@ -34729,7 +34811,8 @@ void test_JetStreamGetMsgAsync(void)
     arg.msg = NULL;
 
     test("Message not found: ");
-    s = js_getMsgAsync(js, "GET_MSG_ASYNC", 100, NULL, NULL, _getMsgAsyncCb, (void*) &arg);
+    greq = (jsStreamMsgGetReq) { .seq = 100 };
+    s = js_getStreamMsgAsync(js, "GET_MSG_ASYNC", NULL, &greq, _getMsgAsyncCb, (void*) &arg);
     IFOK(s, _waitForAsyncGet(&arg, 2000));
     testCond((s == NATS_OK) && (arg.status == NATS_NOT_FOUND) && (arg.msg == NULL)
                 && (arg.jerr == JSNoMessageFoundErr));
@@ -34738,7 +34821,9 @@ void test_JetStreamGetMsgAsync(void)
     test("No responders: ");
     jsOptions_Init(&o);
     o.Prefix = "$JS.DOESNOTEXIST.API";
-    s = js_getMsgAsync(js, "GET_MSG_ASYNC", 1, NULL, &o, _getMsgAsyncCb, (void*) &arg);
+    // The remaining requests all get the message with sequence 1.
+    greq = (jsStreamMsgGetReq) { .seq = 1 };
+    s = js_getStreamMsgAsync(js, "GET_MSG_ASYNC", &o, &greq, _getMsgAsyncCb, (void*) &arg);
     IFOK(s, _waitForAsyncGet(&arg, 2000));
     testCond((s == NATS_OK) && (arg.status == NATS_NO_RESPONDERS) && (arg.msg == NULL)
                 && (arg.jerr == JSNotEnabledErr));
@@ -34754,7 +34839,7 @@ void test_JetStreamGetMsgAsync(void)
     jsOptions_Init(&o);
     o.Prefix = "$JS.NOREPLY.API";
     o.Wait   = 250;
-    s = js_getMsgAsync(js, "GET_MSG_ASYNC", 1, NULL, &o, _getMsgAsyncCb, (void*) &arg);
+    s = js_getStreamMsgAsync(js, "GET_MSG_ASYNC", &o, &greq, _getMsgAsyncCb, (void*) &arg);
     IFOK(s, _waitForAsyncGet(&arg, 2000));
     testCond((s == NATS_OK) && (arg.status == NATS_TIMEOUT) && (arg.msg == NULL));
 
@@ -34765,7 +34850,7 @@ void test_JetStreamGetMsgAsync(void)
     jsOptions_Init(&o);
     o.PublishAsync.MuxReplies = true;
     s = natsConnection_JetStream(&js2, nc, &o);
-    IFOK(s, js_getMsgAsync(js2, "GET_MSG_ASYNC", 1, NULL, NULL, _getMsgAsyncCb, (void*) &arg));
+    IFOK(s, js_getStreamMsgAsync(js2, "GET_MSG_ASYNC", NULL, &greq, _getMsgAsyncCb, (void*) &arg));
     IFOK(s, _waitForAsyncGet(&arg, 2000));
     testCond((s == NATS_OK) && (arg.status == NATS_OK) && (arg.msg != NULL)
                 && (natsMsg_GetSequence(arg.msg) == 1)
@@ -34785,7 +34870,7 @@ void test_JetStreamGetMsgAsync(void)
     jsOptions_Init(&o);
     o.Prefix = "$JS.NOREPLY.API";
     o.Wait   = 10000;
-    s = js_getMsgAsync(js, "GET_MSG_ASYNC", 1, NULL, &o, _getMsgAsyncCb, (void*) &arg);
+    s = js_getStreamMsgAsync(js, "GET_MSG_ASYNC", &o, &greq, _getMsgAsyncCb, (void*) &arg);
     if (s == NATS_OK)
     {
         jsCtx_Destroy(js);
@@ -34801,7 +34886,7 @@ void test_JetStreamGetMsgAsync(void)
     o.Prefix = "$JS.NOREPLY.API";
     o.Wait   = 250;
     s = natsConnection_JetStream(&js2, nc, NULL);
-    IFOK(s, js_getMsgAsync(js2, "GET_MSG_ASYNC", 1, NULL, &o, _getMsgAsyncCb, (void*) &arg));
+    IFOK(s, js_getStreamMsgAsync(js2, "GET_MSG_ASYNC", &o, &greq, _getMsgAsyncCb, (void*) &arg));
     if (s == NATS_OK)
     {
         natsConnection_Close(nc);
@@ -34820,7 +34905,7 @@ void test_JetStreamDirectGetMsgAsync(void)
 {
     natsStatus              s;
     jsStreamConfig          cfg;
-    jsDirectGetMsgOptions   dgo;
+    jsStreamMsgGetReq       greq;
     jsErrCode               jerr = 0;
     struct threadArg        arg;
 
@@ -34847,22 +34932,20 @@ void test_JetStreamDirectGetMsgAsync(void)
     testCond(s == NATS_OK);
 
     test("Bad args: ");
-    jsDirectGetMsgOptions_Init(&dgo);
-    dgo.Sequence = 1;
-    s = js_directGetMsgAsync(NULL, "DGM_ASYNC", NULL, &dgo, _getMsgAsyncCb, (void*) &arg);
+    greq = (jsStreamMsgGetReq) { .direct = true, .seq = 1 };
+    s = js_getStreamMsgAsync(NULL, "DGM_ASYNC", NULL, &greq, _getMsgAsyncCb, (void*) &arg);
     if (s == NATS_INVALID_ARG)
-        s = js_directGetMsgAsync(js, "DGM_ASYNC", NULL, NULL, _getMsgAsyncCb, (void*) &arg);
+        s = js_getStreamMsgAsync(js, "DGM_ASYNC", NULL, NULL, _getMsgAsyncCb, (void*) &arg);
     if (s == NATS_INVALID_ARG)
-        s = js_directGetMsgAsync(js, "DGM_ASYNC", NULL, &dgo, NULL, (void*) &arg);
+        s = js_getStreamMsgAsync(js, "DGM_ASYNC", NULL, &greq, NULL, (void*) &arg);
     if (s == NATS_INVALID_ARG)
-        s = js_directGetMsgAsync(js, NULL, NULL, &dgo, _getMsgAsyncCb, (void*) &arg);
+        s = js_getStreamMsgAsync(js, NULL, NULL, &greq, _getMsgAsyncCb, (void*) &arg);
     testCond(s == NATS_INVALID_ARG);
     nats_clearLastError();
 
     test("Get by sequence: ");
-    jsDirectGetMsgOptions_Init(&dgo);
-    dgo.Sequence = 2;
-    s = js_directGetMsgAsync(js, "DGM_ASYNC", NULL, &dgo, _getMsgAsyncCb, (void*) &arg);
+    greq = (jsStreamMsgGetReq) { .direct = true, .seq = 2 };
+    s = js_getStreamMsgAsync(js, "DGM_ASYNC", NULL, &greq, _getMsgAsyncCb, (void*) &arg);
     IFOK(s, _waitForAsyncGet(&arg, 2000));
     testCond((s == NATS_OK) && (arg.status == NATS_OK) && (arg.msg != NULL)
                 && (strcmp(natsMsg_GetSubject(arg.msg), "bar") == 0)
@@ -34874,9 +34957,8 @@ void test_JetStreamDirectGetMsgAsync(void)
     arg.msg = NULL;
 
     test("Get last by subject: ");
-    jsDirectGetMsgOptions_Init(&dgo);
-    dgo.LastBySubject = "foo";
-    s = js_directGetMsgAsync(js, "DGM_ASYNC", NULL, &dgo, _getMsgAsyncCb, (void*) &arg);
+    greq = (jsStreamMsgGetReq) { .direct = true, .lastBySubject = "foo" };
+    s = js_getStreamMsgAsync(js, "DGM_ASYNC", NULL, &greq, _getMsgAsyncCb, (void*) &arg);
     IFOK(s, _waitForAsyncGet(&arg, 2000));
     testCond((s == NATS_OK) && (arg.status == NATS_OK) && (arg.msg != NULL)
                 && (strcmp(natsMsg_GetSubject(arg.msg), "foo") == 0)
@@ -34886,10 +34968,8 @@ void test_JetStreamDirectGetMsgAsync(void)
     arg.msg = NULL;
 
     test("Get next by subject: ");
-    jsDirectGetMsgOptions_Init(&dgo);
-    dgo.Sequence = 2;
-    dgo.NextBySubject = "foo";
-    s = js_directGetMsgAsync(js, "DGM_ASYNC", NULL, &dgo, _getMsgAsyncCb, (void*) &arg);
+    greq = (jsStreamMsgGetReq) { .direct = true, .seq = 2, .nextBySubject = "foo" };
+    s = js_getStreamMsgAsync(js, "DGM_ASYNC", NULL, &greq, _getMsgAsyncCb, (void*) &arg);
     IFOK(s, _waitForAsyncGet(&arg, 2000));
     testCond((s == NATS_OK) && (arg.status == NATS_OK) && (arg.msg != NULL)
                 && (strcmp(natsMsg_GetSubject(arg.msg), "foo") == 0)
@@ -34898,17 +34978,15 @@ void test_JetStreamDirectGetMsgAsync(void)
     arg.msg = NULL;
 
     test("Message not found: ");
-    jsDirectGetMsgOptions_Init(&dgo);
-    dgo.Sequence = 100;
-    s = js_directGetMsgAsync(js, "DGM_ASYNC", NULL, &dgo, _getMsgAsyncCb, (void*) &arg);
+    greq = (jsStreamMsgGetReq) { .direct = true, .seq = 100 };
+    s = js_getStreamMsgAsync(js, "DGM_ASYNC", NULL, &greq, _getMsgAsyncCb, (void*) &arg);
     IFOK(s, _waitForAsyncGet(&arg, 2000));
     testCond((s == NATS_OK) && (arg.status == NATS_NOT_FOUND) && (arg.msg == NULL));
     nats_clearLastError();
 
     test("Stream not found: ");
-    jsDirectGetMsgOptions_Init(&dgo);
-    dgo.LastBySubject = "foo";
-    s = js_directGetMsgAsync(js, "DOESNOTEXIST", NULL, &dgo, _getMsgAsyncCb, (void*) &arg);
+    greq = (jsStreamMsgGetReq) { .direct = true, .lastBySubject = "foo" };
+    s = js_getStreamMsgAsync(js, "DOESNOTEXIST", NULL, &greq, _getMsgAsyncCb, (void*) &arg);
     IFOK(s, _waitForAsyncGet(&arg, 2000));
     testCond((s == NATS_OK) && (arg.status == NATS_NO_RESPONDERS) && (arg.msg == NULL));
     nats_clearLastError();
@@ -36857,6 +36935,13 @@ void test_KeyValueGetAsync(void)
         kvEntry_Destroy(arg.kve);
         arg.kve = NULL;
     }
+
+    test("Callbacks invoked once each: ");
+    nats_Sleep(300);
+    natsMutex_Lock(arg.m);
+    s = (arg.sum == 12 ? NATS_OK : NATS_ERR);
+    natsMutex_Unlock(arg.m);
+    testCond(s == NATS_OK);
 
     JS_TEARDOWN;
     _destroyDefaultThreadArgs(&arg);
@@ -39293,6 +39378,12 @@ void test_ObjectStore_PutAndGet(void)
 #endif
     objStoreConfig      cfg;
     objStoreMeta        meta;
+    uint64_t            badSizes[5] = {2147483647, 2147483648, 4294967296, 4294967297, 4294967312};
+    char                metaInfo[1024];
+    char                chunk[64];
+    int                 iter, i;
+
+    memset(chunk, 'x', sizeof(chunk));
 
     JS_SETUP(2, 10, 0);
 
@@ -39960,7 +40051,233 @@ void test_ObjectStore_PutAndGet(void)
 
     objStorePut_Destroy(put);
     objStore_Destroy(obs);
+    obs = NULL;
     free(chunkSubj);
+
+    for (i=0; i<(int)(sizeof(badSizes)/sizeof(uint64_t)); i++)
+    {
+        char title[128];
+
+        snprintf(title, sizeof(title), "Create object store (%" PRIu64 "): ", badSizes[i]);
+        test(title);
+        objStoreConfig_Init(&cfg);
+        cfg.Bucket = "B";
+        cfg.Description = "Test Get Failures";
+        cfg.Storage = js_MemoryStorage;
+        s = js_CreateObjectStore(&obs, js, &cfg);
+        testCond((s == NATS_OK) && (obs != NULL));
+
+        snprintf(metaInfo, sizeof(metaInfo), "{\"name\":\"x\",\"bucket\":\"B\",\"nuid\":\"bad\","
+                "\"size\":%" PRIu64 ",\"mtime\":\"2026-09-09T00:00:00Z\","
+                "\"chunks\":1,\"digest\":\"SHA-256=unused\",\"deleted\":false}", badSizes[i]);
+
+        test("Publish bad data: ");
+        s = natsConnection_Publish(nc, "$O.B.M.eA==", metaInfo, (int) strlen(metaInfo));
+        IFOK(s, natsConnection_Publish(nc, "$O.B.C.bad", chunk, (int) sizeof(chunk)));
+        IFOK(s, natsConnection_Flush(nc));
+        testCond(s == NATS_OK);
+
+        test("Wait for data: ");
+        for (iter = 0; iter < 5; iter++)
+        {
+            s = objStore_GetInfo(&info, obs, "x", NULL);
+            if (s == NATS_OK)
+            {
+                objStoreInfo_Destroy(info);
+                info = NULL;
+                break;
+            }
+            nats_Sleep(100);
+            nats_clearLastError();
+        }
+        testCond(s == NATS_OK);
+
+        test("Check GetString fails: ");
+        str = NULL;
+        s = objStore_GetString(&str, obs, "x", NULL);
+        testCond((s == NATS_INSUFFICIENT_BUFFER) && (str == NULL));
+        nats_clearLastError();
+
+        if (badSizes[i] > INT_MAX)
+        {
+            test("Check GetBytes fails: ");
+            data = NULL;
+            len = 0;
+            s = objStore_GetBytes(&data, &len, obs, "x", NULL);
+            testCond((s == NATS_INSUFFICIENT_BUFFER) && (data == NULL) && (len == 0));
+            nats_clearLastError();
+
+            test("Create get: ");
+            s = objStore_Get(&get, obs, "x", NULL);
+            testCond((s == NATS_OK) && (get != NULL));
+
+            test("Check ReadAll fails: ");
+            s = objStoreGet_ReadAll(&data, &len, get, 1000);
+            testCond((s == NATS_INSUFFICIENT_BUFFER) && (data == NULL) && (len == 0));
+            nats_clearLastError();
+
+            test("Check Read is ok: ");
+            done = false;
+            s = objStoreGet_Read(&done, &data, &len, get, 1000);
+            testCond((s == NATS_OK) && !done && (data != NULL) && (len == 64));
+            free(data);
+            data = NULL;
+
+            objStoreGet_Destroy(get);
+            get = NULL;
+        }
+
+        test("Delete store: ");
+        s = js_DeleteObjectStore(js, "B");
+        testCond(s == NATS_OK);
+
+        objStore_Destroy(obs);
+        obs = NULL;
+    }
+
+    test("Create object store to check missing digest: ");
+    objStoreConfig_Init(&cfg);
+    cfg.Bucket = "C";
+    cfg.Description = "Test Missing Digest";
+    cfg.Storage = js_MemoryStorage;
+    s = js_CreateObjectStore(&obs, js, &cfg);
+    testCond((s == NATS_OK) && (obs != NULL));
+
+    snprintf(metaInfo, sizeof(metaInfo), "%s", "{\"name\":\"x\",\"bucket\":\"C\",\"nuid\":\"bad\","
+            "\"size\":64,\"mtime\":\"2026-09-09T00:00:00Z\","
+            "\"chunks\":1,\"deleted\":false}");
+
+    test("Publish bad data: ");
+    s = natsConnection_Publish(nc, "$O.C.M.eA==", metaInfo, (int) strlen(metaInfo));
+    IFOK(s, natsConnection_Publish(nc, "$O.C.C.bad", chunk, (int) sizeof(chunk)));
+    IFOK(s, natsConnection_Flush(nc));
+    testCond(s == NATS_OK);
+
+    test("Wait for data: ");
+    for (iter = 0; iter < 5; iter++)
+    {
+        s = objStore_GetInfo(&info, obs, "x", NULL);
+        if (s == NATS_OK)
+        {
+            objStoreInfo_Destroy(info);
+            info = NULL;
+            break;
+        }
+        nats_Sleep(100);
+        nats_clearLastError();
+    }
+    testCond(s == NATS_OK);
+
+    test("Check GetString: ");
+    str = NULL;
+    s = objStore_GetString(&str, obs, "x", NULL);
+    testCond((s == NATS_ILLEGAL_STATE) && (str == NULL)
+                && (strstr(nats_GetLastError(NULL), obsErrBadObjectMeta) != NULL));
+    nats_clearLastError();
+
+    test("Check GetBytes: ");
+    data = NULL;
+    len = 0;
+    s = objStore_GetBytes(&data, &len, obs, "x", NULL);
+    testCond((s == NATS_ILLEGAL_STATE) && (data == NULL) && (len == 0)
+                && (strstr(nats_GetLastError(NULL), obsErrBadObjectMeta) != NULL));
+    nats_clearLastError();
+
+    test("Create get: ");
+    s = objStore_Get(&get, obs, "x", NULL);
+    testCond((s == NATS_ILLEGAL_STATE) && (get == NULL)
+                && (strstr(nats_GetLastError(NULL), obsErrBadObjectMeta) != NULL));
+    nats_clearLastError();
+
+    objStore_Destroy(obs);
+    obs = NULL;
+
+    JS_TEARDOWN;
+}
+
+void test_ObjectStore_PutFlowControl(void)
+{
+    natsStatus      s;
+    natsConnection  *nc     = NULL;
+    jsCtx           *js     = NULL;
+    natsPid         pid     = NATS_INVALID_PID;
+    objStore        *obs    = NULL;
+    objStorePut     *put    = NULL;
+    objStoreInfo    *info   = NULL;
+    void            *data   = NULL;
+    int             len     = 0;
+    char            payload[16*1024];
+    int             i;
+    jsOptions       o;
+    objStoreConfig  cfg;
+    objStoreMeta    meta;
+    char confFile[256] = {'\0'};
+    char datastore[256] = {'\0'};
+    char cmdLine[1024] = {'\0'};
+
+    ENSURE_JS_VERSION(2, 11, 0);
+
+    test("Start server: ");
+    _makeUniqueDir(datastore, sizeof(datastore), "datastore_");
+    _createConfFile(confFile, sizeof(confFile),
+        "jetstream: {\n"
+        "   enabled: true\n"
+        "   max_buffered_size: 10Kb\n"
+        "   max_buffered_msgs: 100\n"
+        "}\n");
+    snprintf(cmdLine, sizeof(cmdLine), "-js -sd %s -c %s", datastore, confFile);
+    pid = _startServer("nats://127.0.0.1:4222", cmdLine, true);
+    CHECK_SERVER_STARTED(pid);
+    testCond(true);
+
+    test("Connect: ");
+    s = natsConnection_Connect(&nc, NULL);
+    testCond(s == NATS_OK);
+
+#ifndef NATS_HAS_TLS
+    nats_hashNoErrorOnNoSSL(true);
+#endif
+
+    test("Create JS context with flow control: ");
+    jsOptions_Init(&o);
+    o.PublishAsync.MaxPending = 1;
+    o.PublishAsync.StallWait  = 5000;
+    s = natsConnection_JetStream(&js, nc, &o);
+    testCond((s == NATS_OK) && (js != NULL));
+
+    test("Create ObjectStore: ");
+    objStoreConfig_Init(&cfg);
+    cfg.Bucket = "FLOW";
+    s = js_CreateObjectStore(&obs, js, &cfg);
+    testCond((s == NATS_OK) && (obs != NULL));
+
+    test("Put inherits the store's flow control: ");
+    objStoreMeta_Init(&meta);
+    meta.Name = "paced";
+    meta.Opts.ChunkSize = 1024;
+    s = objStore_Put(&put, obs, &meta);
+    testCond((s == NATS_OK) && (put != NULL)
+                && (put->pubJS->opts.PublishAsync.MaxPending == 1)
+                && (put->pubJS->opts.PublishAsync.StallWait == 5000));
+
+    test("Put multi-chunk object with one message in flight: ");
+    for (i = 0; i < (int) sizeof(payload); i++)
+        payload[i] = (char) (i % 251);
+    s = objStorePut_Add(put, payload, (int) sizeof(payload));
+    IFOK(s, objStorePut_Complete(&info, put, 0));
+    testCond((s == NATS_OK) && (info != NULL)
+                && (info->Size == sizeof(payload))
+                && (info->Chunks == sizeof(payload) / 1024));
+
+    test("Get it back: ");
+    s = objStore_GetBytes(&data, &len, obs, "paced", NULL);
+    testCond((s == NATS_OK) && (len == (int) sizeof(payload))
+                && (memcmp(data, payload, sizeof(payload)) == 0));
+    free(data);
+
+    objStoreInfo_Destroy(info);
+    objStorePut_Destroy(put);
+    objStore_Destroy(obs);
 
     JS_TEARDOWN;
 }
