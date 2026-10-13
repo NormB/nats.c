@@ -35667,7 +35667,7 @@ void test_JetStreamInfoAlternates(void)
     jsStreamConfig      sc;
     jsStreamSource      ss;
     natsStatus          s;
-    int                 i;
+    int64_t             deadline;
 
     ENSURE_JS_VERSION(2, 9, 0);
 
@@ -35701,17 +35701,16 @@ void test_JetStreamInfoAlternates(void)
     sc.Name = "TEST";
     sc.Subjects = (const char*[1]){"foo"};
     sc.SubjectsLen = 1;
-    // We will try up to 10 times to create the stream. It may fail if the cluster
-    // is not ready to accept the request.
-    for (i=0; (s == NATS_OK) && (i < 10); i++)
+    // A new cluster refuses or ignores JetStream requests until it has elected
+    // its meta leader, and that election alone can take several seconds. Keep
+    // trying until the stream is created, for up to 30 seconds.
+    deadline = nats_Now() + 30000;
+    s = js_AddStream(NULL, js, &sc, NULL, NULL);
+    while ((s != NATS_OK) && (nats_Now() < deadline))
     {
+        nats_clearLastError();
+        nats_Sleep(100);
         s = js_AddStream(NULL, js, &sc, NULL, NULL);
-        if ((s != NATS_OK) && (i < 9))
-        {
-            nats_clearLastError();
-            s = NATS_OK;
-            nats_Sleep(100);
-        }
     }
     testCond(s == NATS_OK);
 
@@ -39031,7 +39030,11 @@ void test_ObjectStore_GlobalMgt(void)
     cfg.Description = "Testing ObjectStore";
     cfg.Storage = js_MemoryStorage;
     cfg.TTL = 10000;
-    cfg.MaxBytes = 1024*1024*1024;
+    // Small enough that the server can reserve it twice: it checks the
+    // create below against its memory limit before it notices the bucket
+    // exists, and would otherwise fail it with "insufficient memory" on a
+    // host with less than about 2.7GB of RAM.
+    cfg.MaxBytes = 64*1024*1024;
     cfg.Metadata.List = (const char*[4]){"field1", "value1", "field2", "value2"};
     cfg.Metadata.Count = 2;
     s = js_CreateObjectStore(&obs, js, &cfg);
@@ -39052,7 +39055,7 @@ void test_ObjectStore_GlobalMgt(void)
     testCond((strcmp(si->Config->Description, "Testing ObjectStore") == 0)
                 && (si->Config->Storage == js_MemoryStorage)
                 && (si->Config->MaxAge == NATS_SECONDS_TO_NANOS(10))
-                && (si->Config->MaxBytes == 1024*1024*1024)
+                && (si->Config->MaxBytes == 64*1024*1024)
                 && (si->Config->Metadata.Count >= 2)); // There may be other meta data fields.
 
     test("Check metadata: ");
@@ -42689,7 +42692,7 @@ void test_JetStreamClusterInfo(void)
     jsStreamInfo        *si             = NULL;
     jsStreamConfig      sc;
     natsStatus          s;
-    int                 i;
+    int64_t             deadline;
 
     ENSURE_JS_VERSION(2, 12, 0);
 
@@ -42724,17 +42727,16 @@ void test_JetStreamClusterInfo(void)
     sc.Subjects = (const char*[1]){"foo"};
     sc.SubjectsLen = 1;
     sc.Replicas = 3;
-    // We will try up to 10 times to create the stream. It may fail if the cluster
-    // is not ready to accept the request.
-    for (i=0; (s == NATS_OK) && (i < 10); i++)
+    // A new cluster refuses or ignores JetStream requests until it has elected
+    // its meta leader, and that election alone can take several seconds. Keep
+    // trying until the stream is created, for up to 30 seconds.
+    deadline = nats_Now() + 30000;
+    s = js_AddStream(NULL, js, &sc, NULL, NULL);
+    while ((s != NATS_OK) && (nats_Now() < deadline))
     {
+        nats_clearLastError();
+        nats_Sleep(100);
         s = js_AddStream(NULL, js, &sc, NULL, NULL);
-        if ((s != NATS_OK) && (i < 9))
-        {
-            nats_clearLastError();
-            s = NATS_OK;
-            nats_Sleep(100);
-        }
     }
     testCond(s == NATS_OK);
 
