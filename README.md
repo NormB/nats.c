@@ -184,6 +184,18 @@ make
 
 Note that experimental APIs may have other dependencies (like SSL).
 
+## Building with DNS SRV support
+
+A server URL can be given as `nats+srv://[user[:password]@]domain` (or `tls+srv://` for TLS): the library then looks up the SRV records of `_nats._tcp.<domain>` and uses their targets as the servers. This needs the resolver API (in libc or `libresolv`) and is off by default, so that a default build has no new dependency. To build it in, define NATS_BUILD_WITH_SRV_LOOKUP:
+```
+# cd ./build
+rm CMakeCache.txt
+cmake .. <build options that you may already use> -DNATS_BUILD_WITH_SRV_LOOKUP=ON
+make
+```
+
+`nats_SupportsSRV()` tells whether the library was built with it. Without it, an SRV URL makes `natsConnection_Connect()` fail with `NATS_NOT_PERMITTED`. See `natsOptions_SetServers()` for how the targets are used.
+
 ## Building with Streaming
 
 When building the library with Streaming support, the NATS library uses the [libprotobuf-c](https://github.com/protobuf-c/protobuf-c) library.

@@ -37,7 +37,7 @@ option(NATS_BUILD_NO_SPIN "Enable if spin code does not compile on your arch" OF
 option(NATS_BUILD_WITH_TLS "Build with TLS support" ON)
 option(NATS_BUILD_TLS_FORCE_HOST_VERIFY "Forces hostname verification" ON)
 option(NATS_BUILD_USE_SODIUM "Build using libsodium library" OFF)
-option(NATS_BUILD_WITH_SRV_LOOKUP "Build with DNS SRV server discovery (nats+srv:// URLs)" ON)
+option(NATS_BUILD_WITH_SRV_LOOKUP "Build with DNS SRV server discovery (nats+srv:// URLs)" OFF)
 option(NATS_BUILD_EXAMPLES "Build examples" ON)
 option(NATS_BUILD_LIBUV_EXAMPLE "Build libuv examples" OFF)
 option(NATS_BUILD_LIBEVENT_EXAMPLE "Build libevent examples" OFF)

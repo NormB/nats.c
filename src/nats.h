@@ -2767,6 +2767,10 @@ nats_GetVersionNumber(void);
  * `_nats._tcp.<domain>` are looked up and each target becomes a `nats://`
  * (or `tls://`) server of the pool. See #natsOptions_SetServers for details.
  *
+ * The support is built only if the library is configured with
+ * `-DNATS_BUILD_WITH_SRV_LOOKUP=ON` (it is off by default) on a platform
+ * that has the resolver API.
+ *
  * Applications that load the library dynamically can use this function to
  * check that the library they loaded supports such URLs: a library without
  * this function would treat `nats+srv://example.com` as the host
