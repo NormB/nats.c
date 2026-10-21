@@ -1773,6 +1773,34 @@ _clearSSL(natsConnection *nc)
 
 // Try to reconnect using the option parameters.
 // This function assumes we are allowed to reconnect.
+// Looks the SRV records of the server pool up again and merges the answers
+// into the pool. The lookups block, so they run without the connection's
+// lock, which must be held when calling this function. The pool's SRV
+// sources do not change after its creation, and nothing else changes the
+// pool while (re)connecting.
+static void
+_refreshSRV(natsConnection *nc)
+{
+    natsSrvPool     *pool    = nc->srvPool;
+    natsSRVResult   *results = NULL;
+    bool            changed  = false;
+
+    if (!natsSrvPool_HasSRV(pool))
+        return;
+
+    natsConn_Unlock(nc);
+    if (natsSrvPool_lookupSRV(pool, nc->opts->timeout, &results) != NATS_OK)
+        nats_clearLastError();
+    natsConn_Lock(nc);
+
+    if (!natsConn_isClosed(nc)
+        && (natsSrvPool_mergeSRV(pool, results, nc->cur, &changed) != NATS_OK))
+    {
+        nats_clearLastError();
+    }
+    natsSrvPool_freeSRVResults(pool, results);
+}
+
 static void
 _doReconnect(void *arg)
 {
@@ -1791,6 +1819,7 @@ _doReconnect(void *arg)
     bool                            postDisconnectedCb = false;
     bool                            postReconnectedCb = false;
     bool                            postConnectedCb = false;
+    int                             srvRounds   = 0;
 
     natsOptions_lock(nc->opts);
     postDisconnectedCb = (nc->opts->disconnectedCb != NULL);
@@ -1836,9 +1865,48 @@ _doReconnect(void *arg)
     // natsSrvPool_GetNextServer.
     // The connection could have been closed entering the thread, so bail out
     // once we detect that the connection is closed.
-    for (i=0; (s == NATS_OK) && !natsConn_isClosed(nc) && (natsSrvPool_GetSize(pool) > 0); )
+    for (i=0; (s == NATS_OK) && !natsConn_isClosed(nc)
+              && ((natsSrvPool_GetSize(pool) > 0) || natsSrvPool_WaitsForSRV(pool)); )
     {
-        nc->cur = natsSrvPool_GetNextServer(pool, nc->opts, nc->cur);
+        // No server yet: the SRV lookups have failed so far. Wait and look
+        // them up again, MaxReconnect times at most.
+        if (natsSrvPool_GetSize(pool) == 0)
+        {
+            if (crd != NULL)
+            {
+                wlf++;
+                natsConn_Unlock(nc);
+                sleepTime = crd(nc, wlf, crdClosure);
+                natsConn_Lock(nc);
+                if (natsConn_isClosed(nc))
+                    break;
+            }
+            else
+            {
+                sleepTime = nc->opts->reconnectWait;
+                if (jitter > 0)
+                    sleepTime += nats_Rand64() % jitter;
+            }
+            natsCondition_TimedWait(nc->reconnectCond, nc->mu, sleepTime);
+            if (natsConn_isClosed(nc))
+                break;
+
+            _refreshSRV(nc);
+            if ((natsSrvPool_GetSize(pool) == 0)
+                && (nc->opts->maxReconnect >= 0)
+                && (++srvRounds > nc->opts->maxReconnect))
+            {
+                nc->err = NATS_NO_SERVER;
+                break;
+            }
+            continue;
+        }
+
+        // There is no current server if the pool started empty.
+        if (nc->cur == NULL)
+            nc->cur = natsSrvPool_GetSrv(pool, 0);
+        else
+            nc->cur = natsSrvPool_GetNextServer(pool, nc->opts, nc->cur);
         if (nc->cur == NULL)
         {
             nc->err = NATS_NO_SERVER;
@@ -1878,6 +1946,14 @@ _doReconnect(void *arg)
         // Check if we have been closed first.
         if (natsConn_isClosed(nc))
             break;
+
+        // The whole pool has been tried: look the SRV records up again.
+        if (doSleep)
+        {
+            _refreshSRV(nc);
+            if (natsConn_isClosed(nc))
+                break;
+        }
 
         // Mark that we tried a reconnect
         nc->cur->reconnects += 1;
@@ -2310,6 +2386,20 @@ _connect(natsConnection *nc)
 
     pool = nc->srvPool;
 
+    // The pool is empty if its SRV lookups failed (and the connection
+    // retries). Create the buffer that a connect attempt would have created:
+    // publish calls use it while not connected.
+    if ((nc->bw == NULL) && (natsSrvPool_GetSize(pool) == 0))
+    {
+        s = natsBuf_Create(&(nc->bw), nc->opts->ioBufSize);
+        if (s != NATS_OK)
+        {
+            nc->initc = false;
+            natsConn_Unlock(nc);
+            return NATS_UPDATE_ERR_STACK(s);
+        }
+    }
+
     if ((retryOnFailedConnect) && !hasConnectedCb)
     {
         retry = true;
@@ -2371,6 +2461,9 @@ _connect(natsConnection *nc)
 
         if (wtime > 0)
             nats_Sleep(wtime);
+
+        // The whole pool has been tried: look the SRV records up again.
+        _refreshSRV(nc);
     }
 
     // If not connected and retry asynchronously on failed connect
@@ -2390,7 +2483,12 @@ _connect(natsConnection *nc)
     }
 
     if ((retSts == NATS_OK) && (nc->status != NATS_CONN_STATUS_CONNECTED))
-        s = nats_setDefaultError(NATS_NO_SERVER);
+    {
+        if ((natsSrvPool_GetSize(pool) == 0) && natsSrvPool_HasSRV(pool))
+            s = nats_setError(NATS_NO_SERVER, "%s", pool->srvErr);
+        else
+            s = nats_setDefaultError(NATS_NO_SERVER);
+    }
 
     nc->initc = false;
     natsConn_Unlock(nc);
@@ -4371,7 +4469,7 @@ natsConnection_GetConnectedUrl(natsConnection *nc, char *buffer, size_t bufferSi
     buffer[0] = '\0';
 
     if (((nc->status == NATS_CONN_STATUS_CONNECTED) || (nc->status == NATS_CONN_STATUS_CONNECTING))
-        && (nc->cur->url->fullUrl != NULL))
+        && (nc->cur != NULL) && (nc->cur->url->fullUrl != NULL))
     {
         if (strlen(nc->cur->url->fullUrl) >= bufferSize)
             s = nats_setDefaultError(NATS_INSUFFICIENT_BUFFER);

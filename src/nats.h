@@ -2760,6 +2760,23 @@ nats_GetVersion(void);
 NATS_EXTERN uint32_t
 nats_GetVersionNumber(void);
 
+/** \brief Returns `true` if the library can discover servers with DNS SRV records.
+ *
+ * When supported, a server URL of the form `nats+srv://[user[:password]@]domain`
+ * (or `tls+srv://` for TLS) is not dialed directly: the SRV records of
+ * `_nats._tcp.<domain>` are looked up and each target becomes a `nats://`
+ * (or `tls://`) server of the pool. See #natsOptions_SetServers for details.
+ *
+ * Applications that load the library dynamically can use this function to
+ * check that the library they loaded supports such URLs: a library without
+ * this function would treat `nats+srv://example.com` as the host
+ * `example.com`.
+ *
+ * @return `true` if `nats+srv://` and `tls+srv://` URLs are supported.
+ */
+NATS_EXTERN bool
+nats_SupportsSRV(void);
+
 #ifdef BUILD_IN_DOXYGEN
 /** \brief Check that the header is compatible with the library.
  *

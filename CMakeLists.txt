@@ -258,6 +258,49 @@ if(UNIX)
     endif(NATS_BUILD_NO_SPIN)
   endif(APPLE)
 endif(UNIX)
+# DNS SRV lookups (nats+srv:// URLs) need the resolver API: in the C
+# library or in libresolv, depending on the platform.
+if(UNIX AND NOT ANDROID)
+  include(CheckCSourceCompiles)
+  set(NATS_SRV_PROBE_SRC "
+#include <netinet/in.h>
+#include <arpa/nameser.h>
+#include <resolv.h>
+int main(void)
+{
+    struct __res_state rs; ns_msg m; ns_rr rr; unsigned char b[512]; char n[256];
+    res_ninit(&rs);
+    res_nquery(&rs, \"x\", ns_c_in, ns_t_srv, b, sizeof(b));
+    ns_initparse(b, 0, &m);
+    ns_parserr(&m, ns_s_an, 0, &rr);
+    dn_expand(b, b, b, n, sizeof(n));
+#if defined(__APPLE__)
+    res_ndestroy(&rs);
+#else
+    res_nclose(&rs);
+#endif
+    return 0;
+}")
+  set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+  check_c_source_compiles("${NATS_SRV_PROBE_SRC}" NATS_SRV_IN_LIBC)
+  if(NOT NATS_SRV_IN_LIBC)
+    set(CMAKE_REQUIRED_LIBRARIES resolv)
+    check_c_source_compiles("${NATS_SRV_PROBE_SRC}" NATS_SRV_IN_LIBRESOLV)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+  endif()
+  unset(CMAKE_REQUIRED_DEFINITIONS)
+  if(NATS_SRV_IN_LIBC OR NATS_SRV_IN_LIBRESOLV)
+    add_definitions(-DNATS_HAS_SRV_LOOKUP)
+    if(NATS_SRV_IN_LIBRESOLV)
+      set(NATS_RESOLV_LINK "resolv")
+      list(APPEND NATS_EXTRA_LIB ${NATS_RESOLV_LINK})
+      set(PKGCONF_LIBS_PRIV "${PKGCONF_LIBS_PRIV} -lresolv")
+    endif()
+  else()
+    message(STATUS "DNS SRV lookups not supported: resolver API not found")
+  endif()
+endif()
+
 add_definitions(-D${NATS_OS})
 add_definitions(-D_REENTRANT)
 if(NATS_BUILD_WITH_TLS)

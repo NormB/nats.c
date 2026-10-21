@@ -20,8 +20,9 @@
 #include "util.h"
 #include "conn.h"
 #include "glib/glib.h"
+#include "srvdns.h"
 
-// Check if the URL has a tls:// scheme (case-insensitive).
+// Check if the URL has a tls:// or tls+srv:// scheme (case-insensitive).
 // Expects trimmed input (callers use nats_Trim before storing URLs).
 static bool
 _hasTLSScheme(const char *url)
@@ -29,7 +30,8 @@ _hasTLSScheme(const char *url)
     if (nats_IsStringEmpty(url))
         return false;
 
-    return (strncasecmp(url, "tls://", 6) == 0);
+    return ((strncasecmp(url, "tls://", 6) == 0)
+            || (strncasecmp(url, NATS_SRV_TLS_SCHEME, strlen(NATS_SRV_TLS_SCHEME)) == 0));
 }
 
 // Forward declaration - defined in TLS/non-TLS conditional blocks below.

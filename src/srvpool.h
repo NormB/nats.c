@@ -1,4 +1,4 @@
-// Copyright 2015-2019 The NATS Authors
+// Copyright 2015-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,6 +16,7 @@
 
 #include "status.h"
 #include "hash.h"
+#include "srvdns.h"
 
 // Tracks individual backend servers.
 typedef struct __natsSrv
@@ -26,8 +27,20 @@ typedef struct __natsSrv
     int         reconnects;
     char        *tlsName;
     int         lastAuthErrCode;
+    bool        fromSRV;    // Found by the SRV lookup of srvSrcs[srvSrc]
+    int         srvSrc;
 
 } natsSrv;
+
+// Outcome of the lookup of each SRV source of a pool.
+typedef struct __natsSRVResult
+{
+    natsStatus      s;
+    natsSRVRecord   *recs;
+    int             count;
+    char            err[256];
+
+} natsSRVResult;
 
 typedef struct __natsSrvPool
 {
@@ -38,6 +51,18 @@ typedef struct __natsSrvPool
     bool        randomize;
     char        *user;
     char        *pwd;
+
+    // "nats+srv://" and "tls+srv://" URLs. Set at creation, then read-only:
+    // can be read without the connection's lock.
+    natsSRVSource   **srvSrcs;
+    int             srvSrcCount;
+    // Keys ("host:port") of SRV targets removed after MaxReconnect failed
+    // attempts: they are not added back by later lookups.
+    natsStrHash     *srvExhausted;
+    // Error of the last SRV lookup that failed.
+    char            srvErr[256];
+    // The pool had at least one server at some point.
+    bool            everPopulated;
 
 } natsSrvPool;
 
@@ -75,6 +100,29 @@ natsSrvPool_addNewURLs(natsSrvPool *pool, const natsUrl *curUrl, char **urls, in
 // Returns an array of servers (as a copy). User is responsible to free the memory.
 natsStatus
 natsSrvPool_GetServers(natsSrvPool *pool, bool implicitOnly, char ***servers, int *count);
+
+#define natsSrvPool_HasSRV(p)               ((p)->srvSrcCount > 0)
+
+// The pool has SRV sources but never had a server: the lookups are retried
+// instead of giving up on an empty pool.
+#define natsSrvPool_WaitsForSRV(p)          (natsSrvPool_HasSRV(p) && !(p)->everPopulated)
+
+// Looks up the SRV sources of the pool. Does not change the pool, so it can
+// (and should, since it blocks) be called without the connection's lock.
+// `*results` has one entry per SRV source; free it with
+// natsSrvPool_freeSRVResults().
+natsStatus
+natsSrvPool_lookupSRV(natsSrvPool *pool, int64_t timeout, natsSRVResult **results);
+
+// Applies the results of natsSrvPool_lookupSRV(): for each successful
+// lookup, the targets not in the pool are added at the end, and the
+// servers of that source that are no longer listed are removed, except
+// `cur`. Sets `*changed` if the pool changed.
+natsStatus
+natsSrvPool_mergeSRV(natsSrvPool *pool, natsSRVResult *results, const natsSrv *cur, bool *changed);
+
+void
+natsSrvPool_freeSRVResults(natsSrvPool *pool, natsSRVResult *results);
 
 // Destroy the pool, freeing up all memory used.
 void
