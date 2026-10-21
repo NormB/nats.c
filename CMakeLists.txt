@@ -37,6 +37,7 @@ option(NATS_BUILD_NO_SPIN "Enable if spin code does not compile on your arch" OF
 option(NATS_BUILD_WITH_TLS "Build with TLS support" ON)
 option(NATS_BUILD_TLS_FORCE_HOST_VERIFY "Forces hostname verification" ON)
 option(NATS_BUILD_USE_SODIUM "Build using libsodium library" OFF)
+option(NATS_BUILD_WITH_SRV_LOOKUP "Build with DNS SRV server discovery (nats+srv:// URLs)" OFF)
 option(NATS_BUILD_EXAMPLES "Build examples" ON)
 option(NATS_BUILD_LIBUV_EXAMPLE "Build libuv examples" OFF)
 option(NATS_BUILD_LIBEVENT_EXAMPLE "Build libevent examples" OFF)
@@ -258,6 +259,72 @@ if(UNIX)
     endif(NATS_BUILD_NO_SPIN)
   endif(APPLE)
 endif(UNIX)
+# DNS SRV lookups (nats+srv:// URLs) need the resolver API: in the C
+# library or in libresolv, depending on the platform.
+if(UNIX AND NOT ANDROID AND NATS_BUILD_WITH_SRV_LOOKUP)
+  include(CheckCSourceCompiles)
+  set(NATS_SRV_PROBE_SRC "
+#include <netinet/in.h>
+#include <arpa/nameser.h>
+#include <resolv.h>
+int main(void)
+{
+    struct __res_state rs; ns_msg m; ns_rr rr; unsigned char b[512]; char n[256];
+    res_ninit(&rs);
+    res_nquery(&rs, \"x\", ns_c_in, ns_t_srv, b, sizeof(b));
+    ns_initparse(b, 0, &m);
+    ns_parserr(&m, ns_s_an, 0, &rr);
+    dn_expand(b, b, b, n, sizeof(n));
+#if defined(__APPLE__)
+    res_ndestroy(&rs);
+#else
+    res_nclose(&rs);
+#endif
+    return 0;
+}")
+  # res_ndestroy() frees the whole resolver state where it exists (BSD,
+  # macOS); res_nclose() may only close its sockets there.
+  set(NATS_SRV_NDESTROY_SRC "
+#include <netinet/in.h>
+#include <arpa/nameser.h>
+#include <resolv.h>
+int main(void)
+{
+    struct __res_state rs;
+    res_ninit(&rs);
+    res_ndestroy(&rs);
+    return 0;
+}")
+  set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+  check_c_source_compiles("${NATS_SRV_PROBE_SRC}" NATS_SRV_IN_LIBC)
+  if(NOT NATS_SRV_IN_LIBC)
+    set(CMAKE_REQUIRED_LIBRARIES resolv)
+    check_c_source_compiles("${NATS_SRV_PROBE_SRC}" NATS_SRV_IN_LIBRESOLV)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+  endif()
+  unset(CMAKE_REQUIRED_DEFINITIONS)
+  if(NATS_SRV_IN_LIBC OR NATS_SRV_IN_LIBRESOLV)
+    add_definitions(-DNATS_HAS_SRV_LOOKUP)
+    if(NATS_SRV_IN_LIBRESOLV)
+      set(NATS_RESOLV_LINK "resolv")
+      list(APPEND NATS_EXTRA_LIB ${NATS_RESOLV_LINK})
+      set(PKGCONF_LIBS_PRIV "${PKGCONF_LIBS_PRIV} -lresolv")
+      set(CMAKE_REQUIRED_LIBRARIES resolv)
+    endif()
+    set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+    check_c_source_compiles("${NATS_SRV_NDESTROY_SRC}" NATS_SRV_HAS_RES_NDESTROY)
+    unset(CMAKE_REQUIRED_DEFINITIONS)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    if(NATS_SRV_HAS_RES_NDESTROY)
+      add_definitions(-DNATS_HAS_RES_NDESTROY)
+    endif()
+  else()
+    message(STATUS "DNS SRV lookups not supported: resolver API not found")
+  endif()
+elseif(NOT NATS_BUILD_WITH_SRV_LOOKUP)
+  add_definitions(-DNATS_NO_SRV_LOOKUP)
+endif()
+
 add_definitions(-D${NATS_OS})
 add_definitions(-D_REENTRANT)
 if(NATS_BUILD_WITH_TLS)

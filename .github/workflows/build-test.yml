@@ -16,6 +16,9 @@ on:
       experimental:
         type: string
         default: "OFF"
+      srv_lookup:
+        type: string
+        default: "OFF"
       pool_dispatch:
         type: string
         default: "NO-pool"
@@ -110,6 +113,9 @@ jobs:
           fi
           if [[ "${{ inputs.experimental }}" == "ON" ]]; then
             flags="$flags -DNATS_WITH_EXPERIMENTAL=ON"
+          fi
+          if [[ "${{ inputs.srv_lookup }}" == "ON" ]]; then
+            flags="$flags -DNATS_BUILD_WITH_SRV_LOOKUP=ON"
           fi
           if [[ -n "${{ inputs.sanitize }}" ]]; then
             flags="$flags -DNATS_SANITIZE=ON -DCMAKE_C_FLAGS=-fsanitize=${{ inputs.sanitize }}"

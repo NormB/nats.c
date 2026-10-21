@@ -29,6 +29,7 @@ jobs:
       verbose_test_output: ON
       verbose_make_output: ON
       experimental: ON
+      srv_lookup: ON
 
   sanitize:
     name: "Sanitize"
@@ -46,6 +47,7 @@ jobs:
       sanitize: ${{ matrix.sanitize }}
       pool_dispatch: ${{ matrix.pooled_dispatch }}
       experimental: ON
+      srv_lookup: ON
 
   coverage-TLS:
     name: "Coverage: TLS"
@@ -65,6 +67,7 @@ jobs:
       pool_dispatch: ${{ matrix.pooled_dispatch }}
       write_deadline: ${{ matrix.write_deadline }}
       experimental: ON
+      srv_lookup: ON
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
@@ -79,6 +82,7 @@ jobs:
       tls: TLS
       verify_host: NO-verify_host
       experimental: ON
+      srv_lookup: ON
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
@@ -92,6 +96,7 @@ jobs:
       compiler: gcc
       tls: NO-TLS
       verify_host: NO-verify_host
+      srv_lookup: ON
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 

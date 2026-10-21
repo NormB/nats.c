@@ -34,6 +34,7 @@
 #include "../src/microp.h"
 #include "../src/glib/glibp.h"
 #include "../src/object.h"
+#include "../src/srvdns.h"
 
 #if defined(NATS_HAS_STREAMING)
 
@@ -7068,6 +7069,2258 @@ void test_ServersRandomize(void)
     natsConnection_Destroy(nc);
     natsOptions_Destroy(opts);
     _stopServer(pid);
+}
+
+void test_SRVHostnameValidation(void)
+{
+    char    name[300];
+    int     i;
+
+    test("Simple names are valid: ");
+    testCond(natsSRV_isValidHostname("example.com")
+             && natsSRV_isValidHostname("a")
+             && natsSRV_isValidHostname("nats-1.example.com")
+             && natsSRV_isValidHostname("_internal.example.com")
+             && natsSRV_isValidHostname("A1-b2.EXAMPLE.com"));
+
+    test("Trailing dot is accepted: ");
+    testCond(natsSRV_isValidHostname("example.com."));
+
+    test("NULL and empty are rejected: ");
+    testCond(!natsSRV_isValidHostname(NULL)
+             && !natsSRV_isValidHostname("")
+             && !natsSRV_isValidHostname("."));
+
+    test("Empty labels are rejected: ");
+    testCond(!natsSRV_isValidHostname(".example.com")
+             && !natsSRV_isValidHostname("example..com")
+             && !natsSRV_isValidHostname("example.com.."));
+
+    test("Special characters are rejected: ");
+    testCond(!natsSRV_isValidHostname("exa\\mple.com")
+             && !natsSRV_isValidHostname("exa\\.mple.com")
+             && !natsSRV_isValidHostname("user@example.com")
+             && !natsSRV_isValidHostname("example.com:4222")
+             && !natsSRV_isValidHostname("example.com/path")
+             && !natsSRV_isValidHostname("exa%41mple.com")
+             && !natsSRV_isValidHostname("exa mple.com")
+             && !natsSRV_isValidHostname("exa\tmple.com")
+             && !natsSRV_isValidHostname("exa\nmple.com")
+             && !natsSRV_isValidHostname("exa\x01mple.com")
+             && !natsSRV_isValidHostname("exa\xc3\xa9mple.com")
+             && !natsSRV_isValidHostname("[::1]")
+             && !natsSRV_isValidHostname("example.com?x=1")
+             && !natsSRV_isValidHostname("example.com#x")
+             && !natsSRV_isValidHostname("ex\"ample.com"));
+
+    test("Label of 63 chars is valid, 64 is not: ");
+    for (i=0; i<63; i++)
+        name[i] = 'a';
+    snprintf(name+63, sizeof(name)-63, ".com");
+    if (natsSRV_isValidHostname(name))
+    {
+        for (i=0; i<64; i++)
+            name[i] = 'a';
+        snprintf(name+64, sizeof(name)-64, ".com");
+        testCond(!natsSRV_isValidHostname(name));
+    }
+    else
+        testCond(false);
+
+    test("Name of 253 chars is valid, 254 is not: ");
+    // 63 + 1 + 63 + 1 + 63 + 1 + 61 = 253
+    memset(name, 'a', sizeof(name));
+    name[63] = '.';
+    name[127] = '.';
+    name[191] = '.';
+    name[253] = '\0';
+    if (natsSRV_isValidHostname(name))
+    {
+        // With the trailing dot, still valid.
+        name[253] = '.';
+        name[254] = '\0';
+        if (natsSRV_isValidHostname(name))
+        {
+            name[253] = 'a';
+            testCond(!natsSRV_isValidHostname(name));
+        }
+        else
+            testCond(false);
+    }
+    else
+        testCond(false);
+}
+
+void test_SRVTargetDomain(void)
+{
+    test("Target in the domain is allowed: ");
+    testCond(natsSRV_isTargetAllowed("example.com", "nats-1.example.com")
+             && natsSRV_isTargetAllowed("example.com", "a.b.example.com")
+             && natsSRV_isTargetAllowed("Example.COM", "nats-1.example.com")
+             && natsSRV_isTargetAllowed("example.com", "NATS-1.EXAMPLE.COM"));
+
+    test("Target equal to the domain is allowed: ");
+    testCond(natsSRV_isTargetAllowed("example.com", "example.com")
+             && natsSRV_isTargetAllowed("localhost", "localhost")
+             && natsSRV_isTargetAllowed("nats.example.com", "nats.example.com"));
+
+    test("With three labels or more, the parent domain is allowed: ");
+    testCond(natsSRV_isTargetAllowed("nats.example.com", "n1.example.com")
+             && natsSRV_isTargetAllowed("nats.example.com", "n1.nats.example.com")
+             && natsSRV_isTargetAllowed("a.b.example.com", "x.b.example.com")
+             && natsSRV_isTargetAllowed("nats.example.com", "example.com"));
+
+    test("Target outside of the domain is refused: ");
+    testCond(!natsSRV_isTargetAllowed("example.com", "attacker.net")
+             && !natsSRV_isTargetAllowed("example.com", "example.com.attacker.net")
+             && !natsSRV_isTargetAllowed("example.com", "badexample.com")
+             && !natsSRV_isTargetAllowed("example.com", "com")
+             && !natsSRV_isTargetAllowed("nats.example.com", "n1.other.com")
+             && !natsSRV_isTargetAllowed("nats.example.com", "n1xexample.com")
+             && !natsSRV_isTargetAllowed("localhost", "evil.host")
+             && !natsSRV_isTargetAllowed("a.b.example.com", "x.example.com"));
+
+    test("Trailing dots are ignored: ");
+    testCond(natsSRV_isTargetAllowed("example.com.", "nats-1.example.com.")
+             && natsSRV_isTargetAllowed("example.com", "nats-1.example.com."));
+
+    test("Empty or NULL are refused: ");
+    testCond(!natsSRV_isTargetAllowed("example.com", "")
+             && !natsSRV_isTargetAllowed("example.com", NULL)
+             && !natsSRV_isTargetAllowed(NULL, "example.com")
+             && !natsSRV_isTargetAllowed("", "example.com"));
+}
+
+void test_SRVParseURL(void)
+{
+    natsStatus      s;
+    natsSRVSource   *src  = NULL;
+    bool            isSRV = true;
+    const char      *notSRV[] = {
+        "nats://example.com",
+        "tls://example.com:4222",
+        "example.com",
+        "nats+srvx://example.com",
+        "nats+srv:/example.com",
+        "nats+srv",
+        "srv://example.com",
+        "ws+srv://example.com",
+        "",
+    };
+    const char      *bad[] = {
+        "nats+srv://",
+        "nats+srv:///",
+        "nats+srv://example.com:4222",
+        "nats+srv://example.com:",
+        "nats+srv://example.com/path",
+        "nats+srv://example.com//",
+        "nats+srv://example.com/?x=1",
+        "nats+srv://[::1]",
+        "nats+srv://exa\\mple.com",
+        "nats+srv://exa mple.com",
+        "nats+srv://example..com",
+        "nats+srv://user:pwd@",
+        "nats+srv://user@exa%41mple.com",
+        "tls+srv://example.com:4443",
+        "nats+srv://example.com,other.com",
+    };
+    int             i;
+
+    for (i=0; i<(int)(sizeof(notSRV)/sizeof(char*)); i++)
+    {
+        test("Not an SRV URL: ");
+        isSRV = true;
+        s = natsSRV_parseURL(&src, &isSRV, notSRV[i]);
+        testCond((s == NATS_OK) && !isSRV && (src == NULL));
+    }
+
+    test("NULL URL is not an SRV URL: ");
+    isSRV = true;
+    s = natsSRV_parseURL(&src, &isSRV, NULL);
+    testCond((s == NATS_OK) && !isSRV && (src == NULL));
+
+    test("nats+srv URL: ");
+    s = natsSRV_parseURL(&src, &isSRV, "nats+srv://example.com");
+    testCond((s == NATS_OK) && isSRV && (src != NULL)
+             && (strcmp(src->domain, "example.com") == 0)
+             && (src->userInfo == NULL) && !src->tls);
+    natsSRV_destroySource(src);
+    src = NULL;
+
+    test("Scheme is case insensitive: ");
+    s = natsSRV_parseURL(&src, &isSRV, "NATS+SRV://Example.COM");
+    testCond((s == NATS_OK) && isSRV && (src != NULL)
+             && (strcmp(src->domain, "Example.COM") == 0) && !src->tls);
+    natsSRV_destroySource(src);
+    src = NULL;
+
+    test("tls+srv URL: ");
+    s = natsSRV_parseURL(&src, &isSRV, "Tls+Srv://example.com");
+    testCond((s == NATS_OK) && isSRV && (src != NULL)
+             && (strcmp(src->domain, "example.com") == 0) && src->tls);
+    natsSRV_destroySource(src);
+    src = NULL;
+
+    test("Trailing dot and slash are removed: ");
+    s = natsSRV_parseURL(&src, &isSRV, "nats+srv://example.com./");
+    testCond((s == NATS_OK) && isSRV && (src != NULL)
+             && (strcmp(src->domain, "example.com") == 0));
+    natsSRV_destroySource(src);
+    src = NULL;
+
+    test("User info is kept as is: ");
+    s = natsSRV_parseURL(&src, &isSRV, "nats+srv://us%40er:p%3Aw@d@example.com");
+    testCond((s == NATS_OK) && isSRV && (src != NULL)
+             && (strcmp(src->domain, "example.com") == 0)
+             && (src->userInfo != NULL)
+             && (strcmp(src->userInfo, "us%40er:p%3Aw@d") == 0));
+    natsSRV_destroySource(src);
+    src = NULL;
+
+    test("The domain follows the last '@', as for other URLs: ");
+    s = natsSRV_parseURL(&src, &isSRV, "nats+srv://dom/@example.com");
+    testCond((s == NATS_OK) && isSRV && (src != NULL)
+             && (strcmp(src->domain, "example.com") == 0)
+             && (strcmp(src->userInfo, "dom/") == 0));
+    natsSRV_destroySource(src);
+    src = NULL;
+
+    test("Token only user info: ");
+    s = natsSRV_parseURL(&src, &isSRV, "nats+srv://mytoken@example.com");
+    testCond((s == NATS_OK) && isSRV && (src != NULL)
+             && (strcmp(src->userInfo, "mytoken") == 0));
+    natsSRV_destroySource(src);
+    src = NULL;
+
+    test("Empty user info is dropped: ");
+    s = natsSRV_parseURL(&src, &isSRV, "nats+srv://@example.com");
+    testCond((s == NATS_OK) && isSRV && (src != NULL)
+             && (src->userInfo == NULL));
+    natsSRV_destroySource(src);
+    src = NULL;
+
+    for (i=0; i<(int)(sizeof(bad)/sizeof(char*)); i++)
+    {
+        test("Invalid SRV URL is rejected: ");
+        s = natsSRV_parseURL(&src, &isSRV, bad[i]);
+        testCond((s == NATS_INVALID_ARG) && isSRV && (src == NULL)
+                 && (strstr(nats_GetLastError(NULL), "SRV") != NULL));
+        nats_clearLastError();
+    }
+
+    test("Destroy NULL source is safe: ");
+    natsSRV_destroySource(NULL);
+    testCond(true);
+}
+
+void test_SRVBuildURL(void)
+{
+    natsStatus      s;
+    natsSRVSource   src;
+    natsSRVRecord   rec;
+    char            *url = NULL;
+
+    memset(&src, 0, sizeof(src));
+    memset(&rec, 0, sizeof(rec));
+    src.domain = (char*) "example.com";
+    rec.target = (char*) "nats-1.example.com";
+    rec.port   = 4223;
+
+    test("Plain URL: ");
+    s = natsSRV_buildURL(&url, &src, &rec);
+    testCond((s == NATS_OK) && (strcmp(url, "nats://nats-1.example.com:4223") == 0));
+    NATS_FREE(url);
+    url = NULL;
+
+    test("TLS URL: ");
+    src.tls = true;
+    s = natsSRV_buildURL(&url, &src, &rec);
+    testCond((s == NATS_OK) && (strcmp(url, "tls://nats-1.example.com:4223") == 0));
+    NATS_FREE(url);
+    url = NULL;
+
+    test("User info is carried: ");
+    src.tls      = false;
+    src.userInfo = (char*) "us%40er:p%3Aw@d";
+    s = natsSRV_buildURL(&url, &src, &rec);
+    testCond((s == NATS_OK)
+             && (strcmp(url, "nats://us%40er:p%3Aw@d@nats-1.example.com:4223") == 0));
+    NATS_FREE(url);
+    url = NULL;
+
+    test("Built URL parses back to the target and credentials: ");
+    {
+        natsUrl *u = NULL;
+
+        s = natsSRV_buildURL(&url, &src, &rec);
+        IFOK(s, natsUrl_Create(&u, url));
+        testCond((s == NATS_OK)
+                 && (strcmp(u->host, "nats-1.example.com") == 0)
+                 && (u->port == 4223)
+                 && (strcmp(u->username, "us@er") == 0)
+                 && (strcmp(u->password, "p:w@d") == 0));
+        natsUrl_Destroy(u);
+        NATS_FREE(url);
+        url = NULL;
+    }
+}
+
+static bool
+_srvOrderIsByPriority(natsSRVRecord *recs, int count)
+{
+    int i;
+
+    for (i=1; i<count; i++)
+        if (recs[i].priority < recs[i-1].priority)
+            return false;
+    return true;
+}
+
+static void
+_srvSetRec(natsSRVRecord *r, int prio, int weight, int port, const char *target)
+{
+    r->priority = prio;
+    r->weight   = weight;
+    r->port     = port;
+    r->target   = (char*) target;
+}
+
+void test_SRVOrder(void)
+{
+    natsSRVRecord   recs[6];
+    natsSRVRecord   orig[6];
+    int             i, j, iter;
+    int             firstHeavy = 0;
+    int             firstZero  = 0;
+    bool            ok         = true;
+
+    test("Zero and one record are fine: ");
+    natsSRV_order(NULL, 0, true);
+    natsSRV_order(NULL, 0, false);
+    _srvSetRec(&recs[0], 5, 5, 4222, "a");
+    natsSRV_order(recs, 1, true);
+    testCond((recs[0].priority == 5) && (strcmp(recs[0].target, "a") == 0));
+
+    _srvSetRec(&orig[0], 20, 10, 4222, "c");
+    _srvSetRec(&orig[1], 10, 0,  4222, "b");
+    _srvSetRec(&orig[2], 10, 50, 4223, "a");
+    _srvSetRec(&orig[3], 30, 1,  4222, "d");
+    _srvSetRec(&orig[4], 10, 50, 4222, "a");
+    _srvSetRec(&orig[5], 20, 10, 4222, "b");
+
+    test("Without randomization, order is deterministic: ");
+    memcpy(recs, orig, sizeof(recs));
+    natsSRV_order(recs, 6, false);
+    testCond((recs[0].priority == 10) && (recs[0].weight == 50)
+             && (strcmp(recs[0].target, "a") == 0) && (recs[0].port == 4222)
+             && (recs[1].priority == 10) && (recs[1].weight == 50)
+             && (strcmp(recs[1].target, "a") == 0) && (recs[1].port == 4223)
+             && (recs[2].priority == 10) && (strcmp(recs[2].target, "b") == 0)
+             && (recs[3].priority == 20) && (strcmp(recs[3].target, "b") == 0)
+             && (recs[4].priority == 20) && (strcmp(recs[4].target, "c") == 0)
+             && (recs[5].priority == 30) && (strcmp(recs[5].target, "d") == 0));
+
+    // Host names are case-insensitive: the case of a target does not change
+    // its place.
+    test("Without randomization, targets are compared regardless of case: ");
+    _srvSetRec(&recs[0], 10, 5, 4222, "B.example.test");
+    _srvSetRec(&recs[1], 10, 5, 4222, "a.example.test");
+    natsSRV_order(recs, 2, false);
+    testCond((strcmp(recs[0].target, "a.example.test") == 0)
+             && (strcmp(recs[1].target, "B.example.test") == 0));
+    memcpy(recs, orig, sizeof(recs));
+
+    test("With randomization, priority order is never violated and no record is lost: ");
+    for (iter=0; ok && (iter<2000); iter++)
+    {
+        int seen[6] = {0};
+
+        memcpy(recs, orig, sizeof(recs));
+        natsSRV_order(recs, 6, true);
+        ok = _srvOrderIsByPriority(recs, 6);
+        for (i=0; ok && (i<6); i++)
+        {
+            for (j=0; j<6; j++)
+            {
+                if ((recs[i].priority == orig[j].priority)
+                    && (recs[i].weight == orig[j].weight)
+                    && (recs[i].port == orig[j].port)
+                    && (strcmp(recs[i].target, orig[j].target) == 0))
+                {
+                    seen[j]++;
+                }
+            }
+        }
+        for (j=0; ok && (j<6); j++)
+            ok = (seen[j] == 1);
+    }
+    testCond(ok);
+
+    test("With randomization, selection follows the weights: ");
+    for (iter=0; iter<2000; iter++)
+    {
+        _srvSetRec(&recs[0], 1, 1,  4222, "light");
+        _srvSetRec(&recs[1], 1, 99, 4222, "heavy");
+        natsSRV_order(recs, 2, true);
+        if (strcmp(recs[0].target, "heavy") == 0)
+            firstHeavy++;
+    }
+    // Expected: ~99%
+    testCond(firstHeavy > 1800);
+
+    test("With randomization, a weight of 0 is rarely, but sometimes, first: ");
+    for (iter=0; iter<2000; iter++)
+    {
+        _srvSetRec(&recs[0], 1, 10, 4222, "ten");
+        _srvSetRec(&recs[1], 1, 0,  4222, "zero");
+        natsSRV_order(recs, 2, true);
+        if (strcmp(recs[0].target, "zero") == 0)
+            firstZero++;
+    }
+    // Expected: 1/11, so ~180
+    testCond((firstZero > 50) && (firstZero < 500));
+
+    test("With randomization, a weight of 0 keeps its chance in every round: ");
+    {
+        int zeroSecond = 0;
+
+        for (iter=0; iter<4000; iter++)
+        {
+            _srvSetRec(&recs[0], 1, 0, 4222, "zero");
+            _srvSetRec(&recs[1], 1, 5, 4222, "b");
+            _srvSetRec(&recs[2], 1, 5, 4222, "c");
+            natsSRV_order(recs, 3, true);
+            if (strcmp(recs[1].target, "zero") == 0)
+                zeroSecond++;
+        }
+        // Expected: (10/11) * (1/6) * 4000 = ~606. If the weight-0 record
+        // lost its place at the front of the second round, ~303.
+        testCond(zeroSecond > 450);
+    }
+
+    test("With randomization, all zero weights are all selected: ");
+    ok = true;
+    for (iter=0; ok && (iter<200); iter++)
+    {
+        int seenA = 0, seenB = 0, seenC = 0;
+
+        _srvSetRec(&recs[0], 1, 0, 4222, "a");
+        _srvSetRec(&recs[1], 1, 0, 4222, "b");
+        _srvSetRec(&recs[2], 1, 0, 4222, "c");
+        natsSRV_order(recs, 3, true);
+        for (i=0; i<3; i++)
+        {
+            if (strcmp(recs[i].target, "a") == 0) seenA++;
+            if (strcmp(recs[i].target, "b") == 0) seenB++;
+            if (strcmp(recs[i].target, "c") == 0) seenC++;
+        }
+        ok = ((seenA == 1) && (seenB == 1) && (seenC == 1));
+    }
+    testCond(ok);
+
+    test("With randomization, all zero weights are shuffled: ");
+    {
+        int firstA = 0, firstB = 0, firstC = 0;
+
+        for (iter=0; iter<900; iter++)
+        {
+            _srvSetRec(&recs[0], 1, 0, 4222, "a");
+            _srvSetRec(&recs[1], 1, 0, 4222, "b");
+            _srvSetRec(&recs[2], 1, 0, 4222, "c");
+            natsSRV_order(recs, 3, true);
+            if (strcmp(recs[0].target, "a") == 0) firstA++;
+            if (strcmp(recs[0].target, "b") == 0) firstB++;
+            if (strcmp(recs[0].target, "c") == 0) firstC++;
+        }
+        // Expected: ~300 each
+        testCond((firstA > 150) && (firstB > 150) && (firstC > 150));
+    }
+
+    test("Maximum weights do not overflow: ");
+    _srvSetRec(&recs[0], 65535, 65535, 4222, "a");
+    _srvSetRec(&recs[1], 65535, 65535, 4223, "a");
+    _srvSetRec(&recs[2], 0, 65535, 4224, "a");
+    natsSRV_order(recs, 3, true);
+    testCond((recs[0].priority == 0) && (recs[1].priority == 65535)
+             && (recs[2].priority == 65535));
+}
+
+#if !defined(_WIN32)
+#include <poll.h>
+#include <arpa/inet.h>
+
+// A minimal DNS server answering SRV queries on 127.0.0.1, used to test the
+// SRV lookups end to end.
+
+#define _DNS_ANSWER         (0) // Reply with the configured answers
+#define _DNS_RCODE          (1) // Reply with no answer and `rcode`
+#define _DNS_DROP           (2) // Do not reply
+#define _DNS_TRUNCATED      (3) // Reply with the answers, cut short
+#define _DNS_BAD_RDLEN      (4) // First answer claims more data than present
+#define _DNS_CNAME_FIRST    (5) // A CNAME record precedes the answers
+
+#define _DNS_MAX_ANSWERS    (80)
+
+typedef struct
+{
+    int         prio;
+    int         weight;
+    int         port;
+    const char  *target;    // Dotted name, "." for the root
+    const char  *wire;      // If set, raw encoded target of `wireLen` bytes
+    int         wireLen;
+    bool        compress;   // Target is `target` followed by the query name
+    bool        ptrLoop;    // Target is a compression pointer to itself
+
+} _testSRVAnswer;
+
+typedef struct
+{
+    natsMutex       *mu;
+    natsThread      *thread;
+    int             fd;
+    int             tcpFd;
+    int             port;
+    bool            done;
+    int             mode;
+    int             rcode;
+    int             count;
+    _testSRVAnswer  answers[_DNS_MAX_ANSWERS];
+    int             queries;
+    int             tcpQueries;
+    int             lastEDNSSize;   // UDP size advertised by the last query, 0 without EDNS0
+    char            lastQName[300];
+
+} _testDNSServer;
+
+static int
+_dnsPutName(unsigned char *buf, int pos, const char *name)
+{
+    const char  *p = name;
+    const char  *dot;
+    int         len;
+
+    while ((p != NULL) && (*p != '\0'))
+    {
+        dot = strchr(p, '.');
+        len = (dot != NULL ? (int)(dot - p) : (int) strlen(p));
+        if (len > 0)
+        {
+            buf[pos++] = (unsigned char) len;
+            memcpy(buf+pos, p, len);
+            pos += len;
+        }
+        p = (dot != NULL ? dot + 1 : NULL);
+    }
+    return pos;
+}
+
+static int
+_dnsPut16(unsigned char *buf, int pos, int v)
+{
+    buf[pos++] = (unsigned char)((v >> 8) & 0xFF);
+    buf[pos++] = (unsigned char)(v & 0xFF);
+    return pos;
+}
+
+// Builds the reply to the query `q`. Over UDP (`udp` true), a reply larger
+// than the size the query allows (512 bytes, or its EDNS0 size) is cut down
+// to its header and question, with the TC bit set, as a real server does:
+// the client then asks again over TCP.
+static int
+_dnsBuildReply(_testDNSServer *dns, unsigned char *q, int qlen, unsigned char *buf, bool udp)
+{
+    int pos = 0;
+    int qend;
+    int i;
+    int ancount = 0;
+    int firstRdlenPos = -1;
+    int udpLimit = 512;
+
+    if (qlen < 17)
+        return -1;
+
+    // End of the query name, then type and class.
+    for (qend = 12; (qend < qlen) && (q[qend] != 0); qend += q[qend] + 1);
+    qend += 5;
+    if (qend > qlen)
+        return -1;
+
+    // An OPT record (root name, type 41) in the additional section: its
+    // class is the UDP size the client accepts.
+    dns->lastEDNSSize = 0;
+    if ((((q[10] << 8) | q[11]) > 0) && (qend + 11 <= qlen)
+        && (q[qend] == 0) && (((q[qend+1] << 8) | q[qend+2]) == 41))
+    {
+        dns->lastEDNSSize = (q[qend+3] << 8) | q[qend+4];
+        if (dns->lastEDNSSize > udpLimit)
+            udpLimit = dns->lastEDNSSize;
+    }
+
+    // Record the query name in dotted form.
+    {
+        int p = 12, n = 0;
+
+        while ((p < qlen) && (q[p] != 0) && (n < (int) sizeof(dns->lastQName) - 65))
+        {
+            if (n > 0)
+                dns->lastQName[n++] = '.';
+            memcpy(dns->lastQName + n, q + p + 1, q[p]);
+            n += q[p];
+            p += q[p] + 1;
+        }
+        dns->lastQName[n] = '\0';
+    }
+
+    if (dns->mode != _DNS_RCODE)
+        ancount = dns->count + (dns->mode == _DNS_CNAME_FIRST ? 1 : 0);
+
+    memcpy(buf, q, 2);
+    pos = 2;
+    pos = _dnsPut16(buf, pos, 0x8180 | (dns->mode == _DNS_RCODE ? dns->rcode : 0));
+    pos = _dnsPut16(buf, pos, 1);
+    pos = _dnsPut16(buf, pos, ancount);
+    pos = _dnsPut16(buf, pos, 0);
+    pos = _dnsPut16(buf, pos, 0);
+    memcpy(buf + pos, q + 12, qend - 12);
+    pos += qend - 12;
+
+    if (dns->mode == _DNS_CNAME_FIRST)
+    {
+        int rdpos;
+
+        pos = _dnsPut16(buf, pos, 0xC00C);
+        pos = _dnsPut16(buf, pos, 5);
+        pos = _dnsPut16(buf, pos, 1);
+        pos = _dnsPut16(buf, pos, 0);
+        pos = _dnsPut16(buf, pos, 60);
+        rdpos = pos;
+        pos += 2;
+        pos = _dnsPutName(buf, pos, "alias.example.test");
+        buf[pos++] = 0;
+        _dnsPut16(buf, rdpos, pos - rdpos - 2);
+    }
+
+    for (i=0; (dns->mode != _DNS_RCODE) && (i<dns->count); i++)
+    {
+        _testSRVAnswer  *a = &(dns->answers[i]);
+        int             rdpos;
+        int             tpos;
+
+        pos = _dnsPut16(buf, pos, 0xC00C);
+        pos = _dnsPut16(buf, pos, 33);
+        pos = _dnsPut16(buf, pos, 1);
+        pos = _dnsPut16(buf, pos, 0);
+        pos = _dnsPut16(buf, pos, 60);
+        rdpos = pos;
+        if (firstRdlenPos < 0)
+            firstRdlenPos = rdpos;
+        pos += 2;
+        pos = _dnsPut16(buf, pos, a->prio);
+        pos = _dnsPut16(buf, pos, a->weight);
+        pos = _dnsPut16(buf, pos, a->port);
+        tpos = pos;
+        if (a->ptrLoop)
+        {
+            pos = _dnsPut16(buf, pos, 0xC000 | tpos);
+        }
+        else if (a->wire != NULL)
+        {
+            memcpy(buf + pos, a->wire, a->wireLen);
+            pos += a->wireLen;
+        }
+        else
+        {
+            pos = _dnsPutName(buf, pos, a->target);
+            if (a->compress)
+                pos = _dnsPut16(buf, pos, 0xC00C);
+            else
+                buf[pos++] = 0;
+        }
+        _dnsPut16(buf, rdpos, pos - rdpos - 2);
+    }
+
+    if ((dns->mode == _DNS_BAD_RDLEN) && (firstRdlenPos >= 0))
+        _dnsPut16(buf, firstRdlenPos, 200);
+    if (dns->mode == _DNS_TRUNCATED)
+        pos -= 10;
+
+    if (udp && (pos > udpLimit))
+    {
+        buf[2] |= 0x02;
+        _dnsPut16(buf, 6, 0);
+        pos = qend;
+    }
+
+    return pos;
+}
+
+// Answers one query received over TCP: two bytes of length, then the
+// message, both ways.
+static void
+_dnsServeTCP(_testDNSServer *dns, unsigned char *buf)
+{
+    unsigned char   q[514];
+    unsigned char   lenBuf[2];
+    struct pollfd   pfd;
+    int             fd, qlen = 0, len, n, got = 0;
+
+    fd = (int) accept(dns->tcpFd, NULL, NULL);
+    if (fd < 0)
+        return;
+
+    pfd.fd     = fd;
+    pfd.events = POLLIN;
+    while ((got < 2) || (got < 2 + qlen))
+    {
+        pfd.revents = 0;
+        if ((poll(&pfd, 1, 1000) <= 0)
+            || ((n = (int) recv(fd, q + got, sizeof(q) - got, 0)) <= 0))
+        {
+            close(fd);
+            return;
+        }
+        got += n;
+        if (got >= 2)
+            qlen = (q[0] << 8) | q[1];
+        if ((got >= 2) && (2 + qlen > (int) sizeof(q)))
+        {
+            close(fd);
+            return;
+        }
+    }
+
+    natsMutex_Lock(dns->mu);
+    dns->tcpQueries++;
+    len = (dns->mode == _DNS_DROP ? -1 : _dnsBuildReply(dns, q + 2, qlen, buf, false));
+    natsMutex_Unlock(dns->mu);
+
+    if (len > 0)
+    {
+        lenBuf[0] = (unsigned char)((len >> 8) & 0xFF);
+        lenBuf[1] = (unsigned char)(len & 0xFF);
+        if (send(fd, lenBuf, 2, 0) == 2)
+            (void) send(fd, buf, len, 0);
+    }
+    close(fd);
+}
+
+static void
+_dnsServerLoop(void *closure)
+{
+    _testDNSServer      *dns = (_testDNSServer*) closure;
+    unsigned char       q[512];
+    unsigned char       *buf = NULL;
+    struct sockaddr_in  from;
+    socklen_t           fromLen;
+    struct pollfd       pfd[2];
+    int                 n;
+    bool                done = false;
+
+    buf = (unsigned char*) malloc(65536);
+    if (buf == NULL)
+        return;
+
+    while (!done)
+    {
+        pfd[0].fd      = dns->fd;
+        pfd[0].events  = POLLIN;
+        pfd[0].revents = 0;
+        pfd[1].fd      = dns->tcpFd;
+        pfd[1].events  = POLLIN;
+        pfd[1].revents = 0;
+
+        n = poll(pfd, 2, 50);
+        if ((n > 0) && (pfd[1].revents & POLLIN))
+            _dnsServeTCP(dns, buf);
+        if ((n > 0) && (pfd[0].revents & POLLIN))
+        {
+            fromLen = sizeof(from);
+            n = (int) recvfrom(dns->fd, q, sizeof(q), 0, (struct sockaddr*) &from, &fromLen);
+            if (n > 0)
+            {
+                int len;
+
+                natsMutex_Lock(dns->mu);
+                dns->queries++;
+                len = (dns->mode == _DNS_DROP ? -1 : _dnsBuildReply(dns, q, n, buf, true));
+                natsMutex_Unlock(dns->mu);
+
+                if (len > 0)
+                    sendto(dns->fd, buf, len, 0, (struct sockaddr*) &from, fromLen);
+            }
+        }
+        natsMutex_Lock(dns->mu);
+        done = dns->done;
+        natsMutex_Unlock(dns->mu);
+    }
+    free(buf);
+}
+
+// Binds a UDP socket and a listening TCP socket to the same port of
+// 127.0.0.1.
+static natsStatus
+_bindDNSSockets(_testDNSServer *dns)
+{
+    struct sockaddr_in  addr;
+    socklen_t           addrLen;
+    int                 attempt;
+
+    for (attempt=0; attempt<20; attempt++)
+    {
+        dns->tcpFd = (int) socket(AF_INET, SOCK_STREAM, 0);
+        dns->fd    = (int) socket(AF_INET, SOCK_DGRAM, 0);
+        if ((dns->tcpFd < 0) || (dns->fd < 0))
+            break;
+
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port        = 0;
+        addrLen = sizeof(addr);
+        if ((bind(dns->tcpFd, (struct sockaddr*) &addr, sizeof(addr)) == 0)
+            && (getsockname(dns->tcpFd, (struct sockaddr*) &addr, &addrLen) == 0)
+            && (bind(dns->fd, (struct sockaddr*) &addr, sizeof(addr)) == 0)
+            && (listen(dns->tcpFd, 8) == 0))
+        {
+            dns->port = ntohs(addr.sin_port);
+            return NATS_OK;
+        }
+        close(dns->tcpFd);
+        close(dns->fd);
+    }
+    if (dns->tcpFd >= 0)
+        close(dns->tcpFd);
+    if (dns->fd >= 0)
+        close(dns->fd);
+    dns->fd = dns->tcpFd = -1;
+    return NATS_SYS_ERROR;
+}
+
+static natsStatus
+_startDNSServer(_testDNSServer *dns)
+{
+    natsStatus          s = NATS_OK;
+
+    memset(dns, 0, sizeof(_testDNSServer));
+    if (_bindDNSSockets(dns) != NATS_OK)
+        return NATS_SYS_ERROR;
+
+    s = natsMutex_Create(&(dns->mu));
+    IFOK(s, natsThread_Create(&(dns->thread), _dnsServerLoop, (void*) dns));
+    if (s == NATS_OK)
+        natsSRV_setTestNameserver("127.0.0.1", dns->port, 1);
+    return s;
+}
+
+static void
+_stopDNSServer(_testDNSServer *dns)
+{
+    natsSRV_setTestNameserver(NULL, 0, 0);
+    if (dns->thread != NULL)
+    {
+        natsMutex_Lock(dns->mu);
+        dns->done = true;
+        natsMutex_Unlock(dns->mu);
+        natsThread_Join(dns->thread);
+        natsThread_Destroy(dns->thread);
+        dns->thread = NULL;
+    }
+    natsMutex_Destroy(dns->mu);
+    dns->mu = NULL;
+    if (dns->fd >= 0)
+        close(dns->fd);
+    if (dns->tcpFd >= 0)
+        close(dns->tcpFd);
+    dns->fd = dns->tcpFd = -1;
+}
+
+static void
+_dnsSet(_testDNSServer *dns, int mode, int rcode)
+{
+    natsMutex_Lock(dns->mu);
+    dns->mode  = mode;
+    dns->rcode = rcode;
+    dns->count = 0;
+    natsMutex_Unlock(dns->mu);
+}
+
+// Changes the mode only, keeping the answers: lets a test switch from
+// failing to answering in one step.
+static void
+_dnsSetMode(_testDNSServer *dns, int mode)
+{
+    natsMutex_Lock(dns->mu);
+    dns->mode = mode;
+    natsMutex_Unlock(dns->mu);
+}
+
+// Adds an answer. The DNS server thread reads the answers, so they are
+// only written with its lock held.
+static void
+_dnsAddEx(_testDNSServer *dns, int prio, int weight, int port, const char *target,
+          const char *wire, int wireLen, bool compress, bool ptrLoop)
+{
+    _testSRVAnswer *a;
+
+    natsMutex_Lock(dns->mu);
+    a = &(dns->answers[dns->count++]);
+    memset(a, 0, sizeof(_testSRVAnswer));
+    a->prio     = prio;
+    a->weight   = weight;
+    a->port     = port;
+    a->target   = (target != NULL ? target : "");
+    a->wire     = wire;
+    a->wireLen  = wireLen;
+    a->compress = compress;
+    a->ptrLoop  = ptrLoop;
+    natsMutex_Unlock(dns->mu);
+}
+
+static void
+_dnsAdd(_testDNSServer *dns, int prio, int weight, int port, const char *target)
+{
+    _dnsAddEx(dns, prio, weight, port, target, NULL, 0, false, false);
+}
+
+static int
+_dnsQueries(_testDNSServer *dns)
+{
+    int n;
+
+    natsMutex_Lock(dns->mu);
+    n = dns->queries;
+    natsMutex_Unlock(dns->mu);
+    return n;
+}
+
+static int
+_dnsTCPQueries(_testDNSServer *dns)
+{
+    int n;
+
+    natsMutex_Lock(dns->mu);
+    n = dns->tcpQueries;
+    natsMutex_Unlock(dns->mu);
+    return n;
+}
+#endif // !_WIN32
+
+static bool
+_srvHasRecord(natsSRVRecord *recs, int count, int prio, int weight, int port, const char *target)
+{
+    int i;
+
+    for (i=0; i<count; i++)
+    {
+        if ((recs[i].priority == prio) && (recs[i].weight == weight)
+            && (recs[i].port == port) && (strcmp(recs[i].target, target) == 0))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void test_SRVLookup(void)
+{
+#if defined(_WIN32)
+    test("Skip when not on Unix: ");
+    testCond(true);
+#else
+    natsStatus      s;
+    _testDNSServer  dns;
+    natsSRVSource   *src   = NULL;
+    natsSRVRecord   *recs  = NULL;
+    int             count  = 0;
+    bool            isSRV  = false;
+    int64_t         start  = 0;
+    char            names[_DNS_MAX_ANSWERS][32];
+    int             i;
+
+#if defined(__GLIBC__) && !defined(NATS_NO_SRV_LOOKUP)
+    test("SRV lookups are supported with glibc: ");
+    testCond(nats_SupportsSRV());
+#endif
+    if (!nats_SupportsSRV())
+    {
+        test("Skip, SRV lookups are not supported on this platform: ");
+        testCond(true);
+        return;
+    }
+
+    test("Start DNS server: ");
+    s = _startDNSServer(&dns);
+    testCond(s == NATS_OK);
+
+    test("Parse URL: ");
+    s = natsSRV_parseURL(&src, &isSRV, "nats+srv://Example.Test");
+    testCond((s == NATS_OK) && isSRV);
+
+    test("Records are returned: ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 10, 60, 4222, "nats-1.example.test");
+    _dnsAdd(&dns, 10, 40, 4223, "nats-2.example.test");
+    _dnsAdd(&dns, 20, 0, 4224, "nats-3.example.test");
+    s = natsSRV_lookup(&recs, &count, src, 1000);
+    testCond((s == NATS_OK) && (count == 3)
+             && _srvHasRecord(recs, count, 10, 60, 4222, "nats-1.example.test")
+             && _srvHasRecord(recs, count, 10, 40, 4223, "nats-2.example.test")
+             && _srvHasRecord(recs, count, 20, 0, 4224, "nats-3.example.test"));
+    natsSRV_destroyRecords(recs, count);
+    recs = NULL;
+    count = 0;
+
+    test("The service name was queried: ");
+    natsMutex_Lock(dns.mu);
+    s = (strcmp(dns.lastQName, "_nats._tcp.Example.Test") == 0 ? NATS_OK : NATS_ERR);
+    natsMutex_Unlock(dns.mu);
+    testCond(s == NATS_OK);
+
+    test("Compressed target names are expanded: ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAddEx(&dns, 1, 1, 4222, "host", NULL, 0, true, false);
+    s = natsSRV_lookup(&recs, &count, src, 1000);
+    testCond((s == NATS_OK) && (count == 1)
+             && _srvHasRecord(recs, count, 1, 1, 4222, "host._nats._tcp.Example.Test"));
+    natsSRV_destroyRecords(recs, count);
+    recs = NULL;
+    count = 0;
+
+    test("Records other than SRV are ignored: ");
+    _dnsSet(&dns, _DNS_CNAME_FIRST, 0);
+    _dnsAdd(&dns, 1, 1, 4222, "nats-1.example.test");
+    s = natsSRV_lookup(&recs, &count, src, 1000);
+    testCond((s == NATS_OK) && (count == 1)
+             && _srvHasRecord(recs, count, 1, 1, 4222, "nats-1.example.test"));
+    natsSRV_destroyRecords(recs, count);
+    recs = NULL;
+    count = 0;
+
+    test("Invalid records are skipped: ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 1, 1, 0, "port-zero.example.test");
+    _dnsAdd(&dns, 1, 1, 4222, "host:1234");
+    _dnsAdd(&dns, 1, 1, 4222, "user@host");
+    _dnsAddEx(&dns, 1, 1, 4222, NULL, "\x07" "ex\0mple" "\x04" "test" "\x00", 14, false, false);
+    _dnsAddEx(&dns, 1, 1, 4222, NULL, "\x03" "a.b" "\x04" "test" "\x00", 10, false, false);
+    _dnsAddEx(&dns, 1, 1, 4222, NULL, "\x03" "a\\b" "\x04" "test" "\x00", 10, false, false);
+    _dnsAddEx(&dns, 1, 1, 4222, NULL, "\x03" "a b" "\x00", 5, false, false);
+    _dnsAddEx(&dns, 1, 1, 4222, NULL, NULL, 0, false, true);
+    _dnsAdd(&dns, 5, 5, 4225, "good.example.test");
+    s = natsSRV_lookup(&recs, &count, src, 1000);
+    testCond((s == NATS_OK) && (count == 1)
+             && _srvHasRecord(recs, count, 5, 5, 4225, "good.example.test"));
+    natsSRV_destroyRecords(recs, count);
+    recs = NULL;
+    count = 0;
+
+    test("Targets outside of the domain are skipped: ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 1, 1, 4222, "nats-1.attacker.net");
+    _dnsAdd(&dns, 1, 1, 4222, "example.test.attacker.net");
+    _dnsAdd(&dns, 1, 1, 4223, "ok.example.test");
+    s = natsSRV_lookup(&recs, &count, src, 1000);
+    testCond((s == NATS_OK) && (count == 1)
+             && _srvHasRecord(recs, count, 1, 1, 4223, "ok.example.test"));
+    natsSRV_destroyRecords(recs, count);
+    recs = NULL;
+    count = 0;
+
+    test("Only targets outside of the domain is an error: ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 1, 1, 4222, "nats-1.attacker.net");
+    s = natsSRV_lookup(&recs, &count, src, 1000);
+    testCond((s == NATS_NO_SERVER) && (recs == NULL) && (count == 0)
+             && (strstr(nats_GetLastError(NULL), "outside") != NULL));
+    nats_clearLastError();
+
+    test("No usable record is an error: ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 1, 1, 0, "port-zero.example.test");
+    _dnsAdd(&dns, 1, 1, 4222, "host:1234");
+    s = natsSRV_lookup(&recs, &count, src, 1000);
+    testCond((s == NATS_NO_SERVER) && (recs == NULL) && (count == 0)
+             && (strstr(nats_GetLastError(NULL), "_nats._tcp.Example.Test") != NULL));
+    nats_clearLastError();
+
+    test("Target '.' means the service is not available: ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 0, 0, 0, ".");
+    s = natsSRV_lookup(&recs, &count, src, 1000);
+    testCond((s == NATS_NO_SERVER) && (recs == NULL) && (count == 0)
+             && (strstr(nats_GetLastError(NULL), "not available") != NULL));
+    nats_clearLastError();
+
+    test("NXDOMAIN is an error: ");
+    _dnsSet(&dns, _DNS_RCODE, 3);
+    s = natsSRV_lookup(&recs, &count, src, 1000);
+    testCond((s == NATS_NO_SERVER) && (recs == NULL) && (count == 0)
+             && (strstr(nats_GetLastError(NULL), "_nats._tcp.Example.Test") != NULL));
+    nats_clearLastError();
+
+    test("SERVFAIL is an error: ");
+    _dnsSet(&dns, _DNS_RCODE, 2);
+    s = natsSRV_lookup(&recs, &count, src, 1000);
+    testCond((s == NATS_NO_SERVER) && (recs == NULL) && (count == 0));
+    nats_clearLastError();
+
+    test("No answer is an error: ");
+    _dnsSet(&dns, _DNS_RCODE, 0);
+    s = natsSRV_lookup(&recs, &count, src, 1000);
+    testCond((s == NATS_NO_SERVER) && (recs == NULL) && (count == 0));
+    nats_clearLastError();
+
+    test("Truncated answer is an error: ");
+    _dnsSet(&dns, _DNS_TRUNCATED, 0);
+    _dnsAdd(&dns, 1, 1, 4222, "nats-1.example.test");
+    _dnsAdd(&dns, 1, 1, 4223, "nats-2.example.test");
+    s = natsSRV_lookup(&recs, &count, src, 1000);
+    testCond((s == NATS_NO_SERVER) && (recs == NULL) && (count == 0));
+    nats_clearLastError();
+
+    test("Record with a bad length is an error: ");
+    _dnsSet(&dns, _DNS_BAD_RDLEN, 0);
+    _dnsAdd(&dns, 1, 1, 4222, "nats-1.example.test");
+    s = natsSRV_lookup(&recs, &count, src, 1000);
+    testCond((s == NATS_NO_SERVER) && (recs == NULL) && (count == 0));
+    nats_clearLastError();
+
+    test("No reply is an error, in bounded time: ");
+    _dnsSet(&dns, _DNS_DROP, 0);
+    start = nats_Now();
+    s = natsSRV_lookup(&recs, &count, src, 1000);
+    testCond((s == NATS_NO_SERVER) && (recs == NULL) && (count == 0)
+             && (nats_Now() - start < 2500));
+    nats_clearLastError();
+
+    test("The timeout bounds the wait: ");
+    start = nats_Now();
+    s = natsSRV_lookup(&recs, &count, src, 3000);
+    testCond((s == NATS_NO_SERVER) && (nats_Now() - start >= 2500)
+             && (nats_Now() - start < 5000));
+    nats_clearLastError();
+
+    // Several nameservers that do not answer: the timeout bounds the
+    // whole lookup, not the wait for each nameserver.
+    test("Several nameservers: the timeout bounds the whole lookup: ");
+    natsSRV_setTestNameserver("127.0.0.1", dns.port, 3);
+    start = nats_Now();
+    s = natsSRV_lookup(&recs, &count, src, 3000);
+    testCond((s == NATS_NO_SERVER) && (nats_Now() - start < 4500));
+    nats_clearLastError();
+    natsSRV_setTestNameserver("127.0.0.1", dns.port, 1);
+
+    // An answer larger than 512 bytes: with EDNS0 it fits in a UDP reply,
+    // without it the server truncates it and the query is sent again over
+    // TCP, which some networks block.
+    test("Answer over 512 bytes comes over UDP (EDNS0): ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    for (i=0; i<20; i++)
+    {
+        snprintf(names[i], sizeof(names[i]), "h%d.example.test", i);
+        _dnsAdd(&dns, 1, 1, 4222, names[i]);
+    }
+    i = _dnsTCPQueries(&dns);
+    s = natsSRV_lookup(&recs, &count, src, 1000);
+    testCond((s == NATS_OK) && (count == 20) && (_dnsTCPQueries(&dns) == i));
+    natsSRV_destroyRecords(recs, count);
+    recs = NULL;
+    count = 0;
+
+    test("Number of records is capped, an answer too large for UDP comes over TCP: ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    for (i=0; i<70; i++)
+    {
+        snprintf(names[i], sizeof(names[i]), "h%d.example.test", i);
+        _dnsAdd(&dns, 1, 1, 4222, names[i]);
+    }
+    i = _dnsTCPQueries(&dns);
+    s = natsSRV_lookup(&recs, &count, src, 1000);
+    testCond((s == NATS_OK) && (count == NATS_SRV_MAX_RECORDS) && (_dnsTCPQueries(&dns) > i));
+    natsSRV_destroyRecords(recs, count);
+    recs = NULL;
+    count = 0;
+
+    test("DNS server was used: ");
+    testCond(_dnsQueries(&dns) > 0);
+
+    natsSRV_destroySource(src);
+    _stopDNSServer(&dns);
+#endif
+}
+
+void test_SRVURLSchemeAutoSecure(void)
+{
+    natsStatus  s;
+    natsOptions *opts = NULL;
+
+#if defined(NATS_HAS_TLS)
+    test("tls+srv:// URL enables TLS: ");
+    s = natsOptions_Create(&opts);
+    IFOK(s, natsOptions_SetURL(opts, "tls+srv://example.test"));
+    testCond((s == NATS_OK) && opts->secure);
+    natsOptions_Destroy(opts);
+    opts = NULL;
+
+    test("TLS+SRV:// (uppercase) URL enables TLS: ");
+    s = natsOptions_Create(&opts);
+    IFOK(s, natsOptions_SetURL(opts, "TLS+SRV://example.test"));
+    testCond((s == NATS_OK) && opts->secure);
+    natsOptions_Destroy(opts);
+    opts = NULL;
+
+    test("tls+srv:// in servers enables TLS: ");
+    s = natsOptions_Create(&opts);
+    IFOK(s, natsOptions_SetServers(opts, (const char*[]){"nats://127.0.0.1:4222", "tls+srv://example.test"}, 2));
+    testCond((s == NATS_OK) && opts->secure);
+    natsOptions_Destroy(opts);
+    opts = NULL;
+
+    test("SetSecure(false) before tls+srv:// URL is respected: ");
+    s = natsOptions_Create(&opts);
+    IFOK(s, natsOptions_SetSecure(opts, false));
+    IFOK(s, natsOptions_SetURL(opts, "tls+srv://example.test"));
+    testCond((s == NATS_OK) && !opts->secure);
+    natsOptions_Destroy(opts);
+    opts = NULL;
+#else
+    test("tls+srv:// URL fails in non-TLS build: ");
+    s = natsOptions_Create(&opts);
+    IFOK(s, natsOptions_SetURL(opts, "tls+srv://example.test"));
+    testCond(s == NATS_ILLEGAL_STATE);
+    natsOptions_Destroy(opts);
+    opts = NULL;
+    nats_clearLastError();
+#endif
+
+    test("nats+srv:// URL does not enable TLS: ");
+    s = natsOptions_Create(&opts);
+    IFOK(s, natsOptions_SetURL(opts, "nats+srv://example.test"));
+    testCond((s == NATS_OK) && !opts->secure);
+    natsOptions_Destroy(opts);
+    opts = NULL;
+
+    test("tls+srvx:// URL does not enable TLS: ");
+    s = natsOptions_Create(&opts);
+    IFOK(s, natsOptions_SetURL(opts, "tls+srvx://example.test"));
+    testCond((s == NATS_OK) && !opts->secure);
+    natsOptions_Destroy(opts);
+    opts = NULL;
+}
+
+#if !defined(_WIN32)
+static bool
+_srvPoolHas(natsSrvPool *pool, int idx, const char *url, bool fromSRV)
+{
+    natsSrv *srv;
+
+    if ((idx < 0) || (idx >= pool->size))
+        return false;
+    srv = pool->srvrs[idx];
+    return ((strcmp(srv->url->fullUrl, url) == 0) && (srv->fromSRV == fromSRV));
+}
+
+static int
+_srvPoolFind(natsSrvPool *pool, const char *url)
+{
+    int i;
+
+    for (i=0; i<pool->size; i++)
+        if (strcmp(pool->srvrs[i]->url->fullUrl, url) == 0)
+            return i;
+    return -1;
+}
+
+static natsStatus
+_srvCreateConn(natsConnection **nc, natsOptions *opts)
+{
+    *nc = NULL;
+    return natsConn_create(nc, natsOptions_clone(opts));
+}
+#endif
+
+void test_SRVServerPool(void)
+{
+#if defined(_WIN32)
+    test("Skip when not on Unix: ");
+    testCond(true);
+#else
+    natsStatus      s;
+    _testDNSServer  dns;
+    natsOptions     *opts = NULL;
+    natsConnection  *nc   = NULL;
+    natsSrvPool     *pool = NULL;
+    const char      *srvOnly[] = {"nats+srv://localhost"};
+    const char      *mixed[]   = {"nats://127.0.0.1:1001", "nats://127.0.0.1:1002",
+                                  "nats://127.0.0.1:1003", "nats+srv://localhost"};
+    const char      *srvFirst[]= {"nats+srv://localhost", "nats://127.0.0.1:1001"};
+    const char      *dupes[]   = {"nats://localhost:4222", "nats+srv://localhost"};
+    int             iter;
+    bool            ok;
+    bool            moved;
+
+    if (!nats_SupportsSRV())
+    {
+        test("Skip, SRV lookups are not supported on this platform: ");
+        testCond(true);
+        return;
+    }
+
+    test("Start DNS server: ");
+    s = _startDNSServer(&dns);
+    IFOK(s, natsOptions_Create(&opts));
+    testCond(s == NATS_OK);
+
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 20, 0, 4223, "localhost");
+    _dnsAdd(&dns, 10, 0, 4222, "localhost");
+
+    test("SRV targets make the pool, by priority: ");
+    s = natsOptions_SetServers(opts, srvOnly, 1);
+    IFOK(s, natsOptions_SetNoRandomize(opts, true));
+    IFOK(s, _srvCreateConn(&nc, opts));
+    pool = (s == NATS_OK ? nc->srvPool : NULL);
+    testCond((s == NATS_OK) && (pool->size == 2)
+             && _srvPoolHas(pool, 0, "nats://localhost:4222", true)
+             && _srvPoolHas(pool, 1, "nats://localhost:4223", true)
+             && (nc->cur == pool->srvrs[0]));
+    natsConn_release(nc);
+    nc = NULL;
+
+    test("With randomization, priority order is kept: ");
+    s = natsOptions_SetNoRandomize(opts, false);
+    for (ok = true, iter=0; ok && (s == NATS_OK) && (iter<50); iter++)
+    {
+        s = _srvCreateConn(&nc, opts);
+        if (s == NATS_OK)
+            ok = (_srvPoolHas(nc->srvPool, 0, "nats://localhost:4222", true)
+                  && _srvPoolHas(nc->srvPool, 1, "nats://localhost:4223", true));
+        natsConn_release(nc);
+        nc = NULL;
+    }
+    testCond((s == NATS_OK) && ok);
+
+    test("Static servers are shuffled among themselves, SRV targets keep their place: ");
+    s = natsOptions_SetServers(opts, mixed, 4);
+    for (ok = true, moved = false, iter=0; ok && (s == NATS_OK) && (iter<200); iter++)
+    {
+        s = _srvCreateConn(&nc, opts);
+        if (s == NATS_OK)
+        {
+            pool = nc->srvPool;
+            ok = ((pool->size == 5)
+                  && _srvPoolHas(pool, 3, "nats://localhost:4222", true)
+                  && _srvPoolHas(pool, 4, "nats://localhost:4223", true)
+                  && !pool->srvrs[0]->fromSRV && !pool->srvrs[1]->fromSRV
+                  && !pool->srvrs[2]->fromSRV);
+            if (strcmp(pool->srvrs[0]->url->fullUrl, "nats://127.0.0.1:1001") != 0)
+                moved = true;
+        }
+        natsConn_release(nc);
+        nc = NULL;
+    }
+    testCond((s == NATS_OK) && ok && moved);
+
+    test("Without randomization, configured order with SRV targets in place: ");
+    s = natsOptions_SetServers(opts, srvFirst, 2);
+    IFOK(s, natsOptions_SetNoRandomize(opts, true));
+    IFOK(s, _srvCreateConn(&nc, opts));
+    pool = (s == NATS_OK ? nc->srvPool : NULL);
+    testCond((s == NATS_OK) && (pool->size == 3)
+             && _srvPoolHas(pool, 0, "nats://localhost:4222", true)
+             && _srvPoolHas(pool, 1, "nats://localhost:4223", true)
+             && _srvPoolHas(pool, 2, "nats://127.0.0.1:1001", false));
+    natsConn_release(nc);
+    nc = NULL;
+
+    test("Static URL option is first, SRV targets keep their order: ");
+    s = natsOptions_SetServers(opts, srvOnly, 1);
+    IFOK(s, natsOptions_SetURL(opts, "nats://127.0.0.1:1000"));
+    IFOK(s, _srvCreateConn(&nc, opts));
+    pool = (s == NATS_OK ? nc->srvPool : NULL);
+    testCond((s == NATS_OK) && (pool->size == 3)
+             && _srvPoolHas(pool, 0, "nats://127.0.0.1:1000", false)
+             && _srvPoolHas(pool, 1, "nats://localhost:4222", true)
+             && _srvPoolHas(pool, 2, "nats://localhost:4223", true));
+    natsConn_release(nc);
+    nc = NULL;
+
+    test("SRV URL option targets come first: ");
+    s = natsOptions_SetServers(opts, (const char*[]){"nats://127.0.0.1:1001", "nats://127.0.0.1:1002"}, 2);
+    IFOK(s, natsOptions_SetURL(opts, "nats+srv://localhost"));
+    IFOK(s, _srvCreateConn(&nc, opts));
+    pool = (s == NATS_OK ? nc->srvPool : NULL);
+    testCond((s == NATS_OK) && (pool->size == 4)
+             && _srvPoolHas(pool, 0, "nats://localhost:4222", true)
+             && _srvPoolHas(pool, 1, "nats://localhost:4223", true)
+             && _srvPoolHas(pool, 2, "nats://127.0.0.1:1001", false)
+             && _srvPoolHas(pool, 3, "nats://127.0.0.1:1002", false));
+    natsConn_release(nc);
+    nc = NULL;
+    s = natsOptions_SetURL(opts, NULL);
+
+    test("Targets already in the pool are not added twice: ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 10, 0, 4222, "localhost");
+    _dnsAdd(&dns, 10, 0, 4222, "LOCALHOST");
+    _dnsAdd(&dns, 20, 0, 4223, "localhost");
+    IFOK(s, natsOptions_SetServers(opts, dupes, 2));
+    IFOK(s, _srvCreateConn(&nc, opts));
+    pool = (s == NATS_OK ? nc->srvPool : NULL);
+    testCond((s == NATS_OK) && (pool->size == 2)
+             && _srvPoolHas(pool, 0, "nats://localhost:4222", false)
+             && _srvPoolHas(pool, 1, "nats://localhost:4223", true));
+    natsConn_release(nc);
+    nc = NULL;
+
+    // Same servers, the static URL listed after the SRV one: the static
+    // server is kept, in the place of the SRV target, whatever the order.
+    test("A static URL listed after the SRV URL replaces the SRV target: ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 10, 0, 4222, "localhost");
+    _dnsAdd(&dns, 20, 0, 4223, "localhost");
+    s = natsOptions_SetServers(opts, (const char*[]){"nats+srv://localhost", "nats://LocalHost:4222"}, 2);
+    IFOK(s, _srvCreateConn(&nc, opts));
+    pool = (s == NATS_OK ? nc->srvPool : NULL);
+    testCond((s == NATS_OK) && (pool->size == 2)
+             && _srvPoolHas(pool, 0, "nats://LocalHost:4222", false)
+             && _srvPoolHas(pool, 1, "nats://localhost:4223", true)
+             && (nc->cur == pool->srvrs[0]));
+    natsConn_release(nc);
+    nc = NULL;
+
+    test("A static URL option that is also an SRV target is tried first: ");
+    s = natsOptions_SetServers(opts, (const char*[]){"nats+srv://localhost"}, 1);
+    IFOK(s, natsOptions_SetURL(opts, "nats://localhost:4223"));
+    IFOK(s, _srvCreateConn(&nc, opts));
+    pool = (s == NATS_OK ? nc->srvPool : NULL);
+    testCond((s == NATS_OK) && (pool->size == 2)
+             && _srvPoolHas(pool, 0, "nats://localhost:4223", false)
+             && _srvPoolHas(pool, 1, "nats://localhost:4222", true)
+             && (nc->cur == pool->srvrs[0]));
+    natsConn_release(nc);
+    nc = NULL;
+    s = natsOptions_SetURL(opts, NULL);
+
+    test("User info is carried to the targets: ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 10, 0, 4222, "localhost");
+    s = natsOptions_SetServers(opts, (const char*[]){"nats+srv://bob:s%40cret@localhost"}, 1);
+    IFOK(s, _srvCreateConn(&nc, opts));
+    pool = (s == NATS_OK ? nc->srvPool : NULL);
+    testCond((s == NATS_OK) && (pool->size == 1)
+             && (strcmp(pool->srvrs[0]->url->host, "localhost") == 0)
+             && (strcmp(pool->srvrs[0]->url->username, "bob") == 0)
+             && (strcmp(pool->srvrs[0]->url->password, "s@cret") == 0)
+             && (pool->user != NULL) && (strcmp(pool->user, "bob") == 0)
+             && (pool->pwd != NULL) && (strcmp(pool->pwd, "s@cret") == 0));
+    natsConn_release(nc);
+    nc = NULL;
+
+#if defined(NATS_HAS_TLS)
+    test("tls+srv:// targets are TLS URLs: ");
+    s = natsOptions_SetServers(opts, (const char*[]){"tls+srv://localhost"}, 1);
+    IFOK(s, _srvCreateConn(&nc, opts));
+    pool = (s == NATS_OK ? nc->srvPool : NULL);
+    testCond((s == NATS_OK) && (pool->size == 1)
+             && _srvPoolHas(pool, 0, "tls://localhost:4222", true));
+    natsConn_release(nc);
+    nc = NULL;
+    natsOptions_Destroy(opts);
+    opts = NULL;
+    s = natsOptions_Create(&opts);
+    IFOK(s, natsOptions_SetNoRandomize(opts, true));
+#endif
+
+    test("Invalid SRV URL is an error: ");
+    IFOK(s, natsOptions_SetServers(opts, (const char*[]){"nats+srv://localhost:4222"}, 1));
+    IFOK(s, _srvCreateConn(&nc, opts));
+    testCond((s == NATS_INVALID_ARG) && (nc == NULL));
+    nats_clearLastError();
+
+    test("Failed lookup is an error, there is no default server: ");
+    _dnsSet(&dns, _DNS_RCODE, 3);
+    s = natsOptions_SetServers(opts, srvOnly, 1);
+    IFOK(s, _srvCreateConn(&nc, opts));
+    testCond((s == NATS_NO_SERVER) && (nc == NULL)
+             && (strstr(nats_GetLastError(NULL), "_nats._tcp.localhost") != NULL));
+    nats_clearLastError();
+
+    test("Failed lookup with other servers: ");
+    s = natsOptions_SetServers(opts, srvFirst, 2);
+    IFOK(s, _srvCreateConn(&nc, opts));
+    pool = (s == NATS_OK ? nc->srvPool : NULL);
+    testCond((s == NATS_OK) && (pool->size == 1)
+             && _srvPoolHas(pool, 0, "nats://127.0.0.1:1001", false));
+    natsConn_release(nc);
+    nc = NULL;
+
+    test("Failed lookup with retry on failed connect: empty pool: ");
+    s = natsOptions_SetServers(opts, srvOnly, 1);
+    IFOK(s, natsOptions_SetRetryOnFailedConnect(opts, true, NULL, NULL));
+    IFOK(s, _srvCreateConn(&nc, opts));
+    pool = (s == NATS_OK ? nc->srvPool : NULL);
+    testCond((s == NATS_OK) && (pool->size == 0) && natsSrvPool_WaitsForSRV(pool)
+             && (nc->cur == NULL));
+    natsConn_release(nc);
+    nc = NULL;
+    nats_clearLastError();
+
+    natsOptions_Destroy(opts);
+    _stopDNSServer(&dns);
+#endif
+}
+
+void test_SRVPoolRefresh(void)
+{
+#if defined(_WIN32)
+    test("Skip when not on Unix: ");
+    testCond(true);
+#else
+    natsStatus      s;
+    _testDNSServer  dns;
+    natsOptions     *opts    = NULL;
+    natsConnection  *nc      = NULL;
+    natsSrvPool     *pool    = NULL;
+    natsSRVResult   *results = NULL;
+    natsSrv         *cur     = NULL;
+    bool            changed  = false;
+    int             idx;
+
+    if (!nats_SupportsSRV())
+    {
+        test("Skip, SRV lookups are not supported on this platform: ");
+        testCond(true);
+        return;
+    }
+
+    test("Start DNS server and create pool: ");
+    s = _startDNSServer(&dns);
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 10, 0, 4221, "n1.localhost");
+    _dnsAdd(&dns, 20, 0, 4222, "n2.localhost");
+    IFOK(s, natsOptions_Create(&opts));
+    IFOK(s, natsOptions_SetNoRandomize(opts, true));
+    IFOK(s, natsOptions_SetServers(opts, (const char*[]){"nats://n9.localhost:4229", "nats+srv://localhost"}, 2));
+    IFOK(s, _srvCreateConn(&nc, opts));
+    pool = (s == NATS_OK ? nc->srvPool : NULL);
+    testCond((s == NATS_OK) && (pool->size == 3) && pool->everPopulated
+             && natsSrvPool_HasSRV(pool) && !natsSrvPool_WaitsForSRV(pool));
+
+    test("New targets are added, missing ones removed, the current one kept: ");
+    cur = pool->srvrs[_srvPoolFind(pool, "nats://n1.localhost:4221")];
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 10, 0, 4222, "n2.localhost");
+    _dnsAdd(&dns, 10, 0, 4223, "n3.localhost");
+    s = natsSrvPool_lookupSRV(pool, 1000, &results);
+    IFOK(s, natsSrvPool_mergeSRV(pool, results, cur, &changed));
+    natsSrvPool_freeSRVResults(pool, results);
+    results = NULL;
+    testCond((s == NATS_OK) && changed && (pool->size == 4)
+             && (_srvPoolFind(pool, "nats://n9.localhost:4229") >= 0)
+             && (_srvPoolFind(pool, "nats://n1.localhost:4221") >= 0)
+             && (_srvPoolFind(pool, "nats://n2.localhost:4222") >= 0)
+             && (_srvPoolFind(pool, "nats://n3.localhost:4223") >= 0)
+             && pool->srvrs[_srvPoolFind(pool, "nats://n3.localhost:4223")]->fromSRV);
+
+    test("Once not current, a target no longer listed is removed: ");
+    cur = pool->srvrs[_srvPoolFind(pool, "nats://n2.localhost:4222")];
+    s = natsSrvPool_lookupSRV(pool, 1000, &results);
+    IFOK(s, natsSrvPool_mergeSRV(pool, results, cur, &changed));
+    natsSrvPool_freeSRVResults(pool, results);
+    results = NULL;
+    testCond((s == NATS_OK) && changed && (pool->size == 3)
+             && (_srvPoolFind(pool, "nats://n1.localhost:4221") < 0)
+             && (_srvPoolFind(pool, "nats://n9.localhost:4229") >= 0));
+
+    // Otherwise the server would count as known: if it came back in the
+    // servers a cluster advertises, it would not be reported as new.
+    test("A removed target is forgotten by the pool: ");
+    {
+        char removed[] = "n1.localhost:4221";
+        char kept[]    = "n2.localhost:4222";
+
+        testCond((natsStrHash_Get(pool->urls, removed) == NULL)
+                 && (natsStrHash_Get(pool->urls, kept) != NULL));
+    }
+
+    test("Same answer, no change: ");
+    s = natsSrvPool_lookupSRV(pool, 1000, &results);
+    IFOK(s, natsSrvPool_mergeSRV(pool, results, cur, &changed));
+    natsSrvPool_freeSRVResults(pool, results);
+    results = NULL;
+    testCond((s == NATS_OK) && !changed && (pool->size == 3));
+
+    test("Failed lookup leaves the pool unchanged: ");
+    _dnsSet(&dns, _DNS_RCODE, 2);
+    s = natsSrvPool_lookupSRV(pool, 1000, &results);
+    IFOK(s, natsSrvPool_mergeSRV(pool, results, cur, &changed));
+    testCond((s == NATS_OK) && (results != NULL) && (results[0].s == NATS_NO_SERVER)
+             && !changed && (pool->size == 3)
+             && (strstr(pool->srvErr, "_nats._tcp.localhost") != NULL));
+    natsSrvPool_freeSRVResults(pool, results);
+    results = NULL;
+    nats_clearLastError();
+
+    test("Target removed after MaxReconnect is not added back: ");
+    s = natsOptions_SetMaxReconnect(opts, 1);
+    idx = _srvPoolFind(pool, "nats://n3.localhost:4223");
+    if ((s == NATS_OK) && (idx >= 0))
+    {
+        natsSrv *n3 = pool->srvrs[idx];
+
+        n3->reconnects = 1;
+        natsSrvPool_GetNextServer(pool, opts, n3);
+    }
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 10, 0, 4222, "n2.localhost");
+    _dnsAdd(&dns, 10, 0, 4223, "n3.localhost");
+    IFOK(s, natsSrvPool_lookupSRV(pool, 1000, &results));
+    IFOK(s, natsSrvPool_mergeSRV(pool, results, cur, &changed));
+    natsSrvPool_freeSRVResults(pool, results);
+    results = NULL;
+    testCond((s == NATS_OK) && (idx >= 0) && (pool->size == 2)
+             && (_srvPoolFind(pool, "nats://n3.localhost:4223") < 0));
+
+    test("Static servers are never removed: ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 10, 0, 4229, "n9.localhost");
+    s = natsSrvPool_lookupSRV(pool, 1000, &results);
+    IFOK(s, natsSrvPool_mergeSRV(pool, results, NULL, &changed));
+    natsSrvPool_freeSRVResults(pool, results);
+    results = NULL;
+    testCond((s == NATS_OK) && (pool->size == 1)
+             && _srvPoolHas(pool, 0, "nats://n9.localhost:4229", false));
+
+    test("Free NULL results is safe: ");
+    natsSrvPool_freeSRVResults(pool, NULL);
+    testCond(true);
+    natsConn_release(nc);
+    nc = NULL;
+
+    // The targets keep the places of the SRV targets in the pool (static
+    // servers do not move), in the order of the new answer: a new target
+    // of a better priority is tried before the others.
+    test("A refresh puts the targets back in priority order: ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 10, 0, 4221, "n1.localhost");
+    _dnsAdd(&dns, 20, 0, 4222, "n2.localhost");
+    s = natsOptions_SetServers(opts, (const char*[]){"nats://n9.localhost:4229", "nats+srv://localhost"}, 2);
+    IFOK(s, natsOptions_SetMaxReconnect(opts, 60));
+    IFOK(s, _srvCreateConn(&nc, opts));
+    pool = (s == NATS_OK ? nc->srvPool : NULL);
+    if (s == NATS_OK)
+    {
+        _dnsSet(&dns, _DNS_ANSWER, 0);
+        _dnsAdd(&dns, 30, 0, 4221, "n1.localhost");
+        _dnsAdd(&dns, 20, 0, 4222, "n2.localhost");
+        _dnsAdd(&dns, 5, 0, 4223, "n3.localhost");
+        s = natsSrvPool_lookupSRV(pool, 1000, &results);
+        IFOK(s, natsSrvPool_mergeSRV(pool, results, pool->srvrs[1], &changed));
+        natsSrvPool_freeSRVResults(pool, results);
+        results = NULL;
+    }
+    testCond((s == NATS_OK) && changed && (pool->size == 4)
+             && _srvPoolHas(pool, 0, "nats://n9.localhost:4229", false)
+             && _srvPoolHas(pool, 1, "nats://n3.localhost:4223", true)
+             && _srvPoolHas(pool, 2, "nats://n2.localhost:4222", true)
+             && _srvPoolHas(pool, 3, "nats://n1.localhost:4221", true));
+
+    natsConn_release(nc);
+    natsOptions_Destroy(opts);
+    _stopDNSServer(&dns);
+#endif
+}
+
+#if !defined(_WIN32)
+static void
+_srvConnectedCb(natsConnection *nc, void *closure)
+{
+    struct threadArg *arg = (struct threadArg*) closure;
+
+    natsMutex_Lock(arg->m);
+    arg->connected = true;
+    natsCondition_Broadcast(arg->c);
+    natsMutex_Unlock(arg->m);
+}
+
+static bool
+_srvConnectedTo(natsConnection *nc, const char *url)
+{
+    char buffer[256];
+
+    buffer[0] = '\0';
+    if (natsConnection_GetConnectedUrl(nc, buffer, sizeof(buffer)) != NATS_OK)
+        return false;
+    return (strcmp(buffer, url) == 0);
+}
+
+static void
+_srvAnswerLater(void *closure)
+{
+    _testDNSServer *dns = (_testDNSServer*) closure;
+
+    nats_Sleep(400);
+    _dnsSet(dns, _DNS_ANSWER, 0);
+    _dnsAdd(dns, 10, 0, 4340, "localhost");
+}
+#endif
+
+// Where SRV lookups are not supported, an SRV URL fails at once: it is not
+// left out, or looked up again and again in vain.
+void test_SRVUnsupported(void)
+{
+    natsStatus      s;
+    natsOptions     *opts = NULL;
+    natsConnection  *nc   = NULL;
+    int64_t         start;
+
+    if (nats_SupportsSRV())
+    {
+        test("Skip, SRV lookups are supported: ");
+        testCond(true);
+        return;
+    }
+
+    test("SRV URL: not permitted: ");
+    s = natsOptions_Create(&opts);
+    IFOK(s, natsOptions_SetURL(opts, "nats+srv://localhost"));
+    IFOK(s, natsOptions_SetMaxReconnect(opts, -1));
+    IFOK(s, natsOptions_SetRetryOnFailedConnect(opts, true, NULL, NULL));
+    start = nats_Now();
+    IFOK(s, natsConnection_Connect(&nc, opts));
+    testCond((s == NATS_NOT_PERMITTED) && (nc == NULL) && (nats_Now() - start < 1000)
+             && (strstr(nats_GetLastError(NULL), "SRV") != NULL));
+    nats_clearLastError();
+
+    test("SRV URL among other servers: not permitted: ");
+    s = natsOptions_SetURL(opts, NULL);
+    IFOK(s, natsOptions_SetServers(opts, (const char*[]){"nats://127.0.0.1:4222", "tls+srv://localhost"}, 2));
+    IFOK(s, natsConnection_Connect(&nc, opts));
+    testCond((s == NATS_NOT_PERMITTED) && (nc == NULL));
+    nats_clearLastError();
+
+    natsOptions_Destroy(opts);
+}
+
+void test_SRVConnect(void)
+{
+#if defined(_WIN32)
+    test("Skip when not on Unix: ");
+    testCond(true);
+#else
+    natsStatus      s;
+    _testDNSServer  dns;
+    natsOptions     *opts = NULL;
+    natsConnection  *nc   = NULL;
+    natsPid         pidA  = NATS_INVALID_PID;
+    natsPid         pidB  = NATS_INVALID_PID;
+    natsPid         pidC  = NATS_INVALID_PID;
+    int             i;
+    bool            ok;
+
+    if (!nats_SupportsSRV())
+    {
+        test("Skip, SRV lookups are not supported on this platform: ");
+        testCond(true);
+        return;
+    }
+
+    pidA = _startServer("nats://127.0.0.1:4340", "-p 4340", true);
+    CHECK_SERVER_STARTED(pidA);
+    pidB = _startServer("nats://127.0.0.1:4341", "-p 4341", true);
+    CHECK_SERVER_STARTED(pidB);
+    pidC = _startServer("nats://bob:s3cret@127.0.0.1:4342", "-p 4342 --user bob --pass s3cret", true);
+    CHECK_SERVER_STARTED(pidC);
+
+    test("Start DNS server: ");
+    s = _startDNSServer(&dns);
+    IFOK(s, natsOptions_Create(&opts));
+    IFOK(s, natsOptions_SetTimeout(opts, 1000));
+    testCond(s == NATS_OK);
+
+    test("Connect to the SRV target: ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 10, 0, 4340, "localhost");
+    s = natsOptions_SetURL(opts, "nats+srv://localhost");
+    IFOK(s, natsConnection_Connect(&nc, opts));
+    testCond((s == NATS_OK) && _srvConnectedTo(nc, "nats://localhost:4340"));
+    natsConnection_Destroy(nc);
+    nc = NULL;
+
+    test("ConnectTo with an SRV URL: ");
+    s = natsConnection_ConnectTo(&nc, "nats+srv://localhost");
+    testCond((s == NATS_OK) && _srvConnectedTo(nc, "nats://localhost:4340"));
+    natsConnection_Destroy(nc);
+    nc = NULL;
+
+    test("Lowest priority first, with randomization: ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 20, 0, 4341, "localhost");
+    _dnsAdd(&dns, 10, 0, 4340, "localhost");
+    for (ok = true, i=0; ok && (i<10); i++)
+    {
+        s = natsConnection_Connect(&nc, opts);
+        ok = ((s == NATS_OK) && _srvConnectedTo(nc, "nats://localhost:4340"));
+        natsConnection_Destroy(nc);
+        nc = NULL;
+    }
+    testCond(ok);
+
+    test("Lowest priority first, without randomization: ");
+    s = natsOptions_SetNoRandomize(opts, true);
+    for (ok = (s == NATS_OK), i=0; ok && (i<10); i++)
+    {
+        s = natsConnection_Connect(&nc, opts);
+        ok = ((s == NATS_OK) && _srvConnectedTo(nc, "nats://localhost:4340"));
+        natsConnection_Destroy(nc);
+        nc = NULL;
+    }
+    testCond(ok);
+
+    test("Next priority when the first target is down: ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 10, 0, 4349, "localhost");
+    _dnsAdd(&dns, 20, 0, 4341, "localhost");
+    s = natsConnection_Connect(&nc, opts);
+    testCond((s == NATS_OK) && _srvConnectedTo(nc, "nats://localhost:4341"));
+    natsConnection_Destroy(nc);
+    nc = NULL;
+
+    test("Credentials of the SRV URL are used: ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 10, 0, 4342, "localhost");
+    s = natsOptions_SetURL(opts, "nats+srv://bob:s3cret@localhost");
+    IFOK(s, natsConnection_Connect(&nc, opts));
+    testCond(s == NATS_OK);
+    natsConnection_Destroy(nc);
+    nc = NULL;
+
+    test("Without them, authorization fails: ");
+    s = natsOptions_SetURL(opts, "nats+srv://localhost");
+    IFOK(s, natsConnection_Connect(&nc, opts));
+    testCond((s != NATS_OK) && (nc == NULL));
+    nats_clearLastError();
+
+    test("Failed lookup: no connection: ");
+    _dnsSet(&dns, _DNS_RCODE, 3);
+    s = natsConnection_Connect(&nc, opts);
+    testCond((s == NATS_NO_SERVER) && (nc == NULL)
+             && (strstr(nats_GetLastError(NULL), "_nats._tcp.localhost") != NULL));
+    nats_clearLastError();
+
+#if defined(NATS_HAS_TLS)
+    test("tls+srv:// connects with TLS to the SRV target: ");
+    {
+        natsPid pidTLS = _startServer("nats://127.0.0.1:4443", "-config tls.conf", true);
+
+        CHECK_SERVER_STARTED(pidTLS);
+        _dnsSet(&dns, _DNS_ANSWER, 0);
+        _dnsAdd(&dns, 10, 0, 4443, "localhost");
+        natsOptions_Destroy(opts);
+        opts = NULL;
+        s = natsOptions_Create(&opts);
+        IFOK(s, natsOptions_SetTimeout(opts, 2000));
+        IFOK(s, natsOptions_SetURL(opts, "tls+srv://localhost"));
+        IFOK(s, natsOptions_SkipServerVerification(opts, true));
+        IFOK(s, natsConnection_Connect(&nc, opts));
+        testCond((s == NATS_OK) && _srvConnectedTo(nc, "tls://localhost:4443"));
+        natsConnection_Destroy(nc);
+        nc = NULL;
+
+        test("nats+srv:// to the same TLS-only target fails: ");
+        s = natsOptions_SetSecure(opts, false);
+        IFOK(s, natsOptions_SetURL(opts, "nats+srv://localhost"));
+        IFOK(s, natsConnection_Connect(&nc, opts));
+        testCond((s != NATS_OK) && (nc == NULL));
+        nats_clearLastError();
+
+        _stopServer(pidTLS);
+    }
+#endif
+
+    natsOptions_Destroy(opts);
+    _stopDNSServer(&dns);
+    _stopServer(pidC);
+    _stopServer(pidB);
+    _stopServer(pidA);
+#endif
+}
+
+void test_SRVReconnect(void)
+{
+#if defined(_WIN32)
+    test("Skip when not on Unix: ");
+    testCond(true);
+#else
+    natsStatus          s;
+    _testDNSServer      dns;
+    natsOptions         *opts = NULL;
+    natsConnection      *nc   = NULL;
+    natsPid             pidA  = NATS_INVALID_PID;
+    natsPid             pidB  = NATS_INVALID_PID;
+    struct threadArg    arg;
+    int                 queries;
+
+    if (!nats_SupportsSRV())
+    {
+        test("Skip, SRV lookups are not supported on this platform: ");
+        testCond(true);
+        return;
+    }
+
+    s = _createDefaultThreadArgsForCbTests(&arg);
+    if (s != NATS_OK)
+        FAIL("Unable to setup test");
+
+    pidA = _startServer("nats://127.0.0.1:4340", "-p 4340", true);
+    CHECK_SERVER_STARTED(pidA);
+    pidB = _startServer("nats://127.0.0.1:4341", "-p 4341", true);
+    CHECK_SERVER_STARTED(pidB);
+
+    test("Start DNS server: ");
+    s = _startDNSServer(&dns);
+    IFOK(s, natsOptions_Create(&opts));
+    IFOK(s, natsOptions_SetTimeout(opts, 1000));
+    IFOK(s, natsOptions_SetURL(opts, "nats+srv://localhost"));
+    IFOK(s, natsOptions_SetReconnectWait(opts, 100));
+    IFOK(s, natsOptions_SetMaxReconnect(opts, -1));
+    IFOK(s, natsOptions_SetReconnectedCB(opts, _reconnectedCb, &arg));
+    testCond(s == NATS_OK);
+
+    test("Connect to the only target: ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 10, 0, 4340, "localhost");
+    s = natsConnection_Connect(&nc, opts);
+    testCond((s == NATS_OK) && _srvConnectedTo(nc, "nats://localhost:4340"));
+
+    test("The records change, the server stops: reconnects to the new target: ");
+    queries = _dnsQueries(&dns);
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 10, 0, 4341, "localhost");
+    _stopServer(pidA);
+    pidA = NATS_INVALID_PID;
+    natsMutex_Lock(arg.m);
+    while ((s != NATS_TIMEOUT) && !arg.reconnected)
+        s = natsCondition_TimedWait(arg.c, arg.m, 5000);
+    natsMutex_Unlock(arg.m);
+    testCond((s == NATS_OK) && _srvConnectedTo(nc, "nats://localhost:4341"));
+
+    test("The records were looked up again: ");
+    testCond(_dnsQueries(&dns) > queries);
+
+    natsConnection_Destroy(nc);
+    natsOptions_Destroy(opts);
+    _stopDNSServer(&dns);
+    _stopServer(pidB);
+    _destroyDefaultThreadArgs(&arg);
+#endif
+}
+
+void test_SRVBootWithDNSDown(void)
+{
+#if defined(_WIN32)
+    test("Skip when not on Unix: ");
+    testCond(true);
+#else
+    natsStatus          s;
+    _testDNSServer      dns;
+    natsOptions         *opts = NULL;
+    natsConnection      *nc   = NULL;
+    natsThread          *t    = NULL;
+    natsPid             pidA  = NATS_INVALID_PID;
+    struct threadArg    arg;
+    char                buffer[256];
+
+    if (!nats_SupportsSRV())
+    {
+        test("Skip, SRV lookups are not supported on this platform: ");
+        testCond(true);
+        return;
+    }
+
+    s = _createDefaultThreadArgsForCbTests(&arg);
+    if (s != NATS_OK)
+        FAIL("Unable to setup test");
+
+    pidA = _startServer("nats://127.0.0.1:4340", "-p 4340", true);
+    CHECK_SERVER_STARTED(pidA);
+
+    test("Start DNS server: ");
+    s = _startDNSServer(&dns);
+    IFOK(s, natsOptions_Create(&opts));
+    IFOK(s, natsOptions_SetTimeout(opts, 1000));
+    IFOK(s, natsOptions_SetURL(opts, "nats+srv://localhost"));
+    IFOK(s, natsOptions_SetReconnectWait(opts, 100));
+    IFOK(s, natsOptions_SetMaxReconnect(opts, 5));
+    testCond(s == NATS_OK);
+
+    test("Retry without callback, lookups keep failing: no server: ");
+    _dnsSet(&dns, _DNS_RCODE, 2);
+    s = natsOptions_SetRetryOnFailedConnect(opts, true, NULL, NULL);
+    IFOK(s, natsConnection_Connect(&nc, opts));
+    testCond((s == NATS_NO_SERVER) && (nc == NULL)
+             && (strstr(nats_GetLastError(NULL), "_nats._tcp.localhost") != NULL));
+    nats_clearLastError();
+
+    test("Retry without callback, the lookups succeed later: connected: ");
+    s = natsOptions_SetMaxReconnect(opts, 50);
+    IFOK(s, natsThread_Create(&t, _srvAnswerLater, (void*) &dns));
+    IFOK(s, natsConnection_Connect(&nc, opts));
+    testCond((s == NATS_OK) && _srvConnectedTo(nc, "nats://localhost:4340"));
+    if (t != NULL)
+    {
+        natsThread_Join(t);
+        natsThread_Destroy(t);
+        t = NULL;
+    }
+    natsConnection_Destroy(nc);
+    nc = NULL;
+
+    test("Retry with callback, lookups failing: not yet connected: ");
+    _dnsSet(&dns, _DNS_RCODE, 2);
+    s = natsOptions_SetMaxReconnect(opts, -1);
+    IFOK(s, natsOptions_SetRetryOnFailedConnect(opts, true, _srvConnectedCb, &arg));
+    IFOK(s, natsConnection_Connect(&nc, opts));
+    testCond((s == NATS_NOT_YET_CONNECTED) && (nc != NULL));
+    nats_clearLastError();
+
+    test("Without a server, flush fails, publish is buffered, no crash: ");
+    s = natsConnection_FlushTimeout(nc, 100);
+    if (s != NATS_OK)
+    {
+        nats_clearLastError();
+        s = natsConnection_PublishString(nc, "foo", "bar");
+    }
+    buffer[0] = 'x';
+    IFOK(s, natsConnection_GetConnectedUrl(nc, buffer, sizeof(buffer)));
+    testCond((s == NATS_OK) && (buffer[0] == '\0'));
+
+    test("The lookups succeed later: connected: ");
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 10, 0, 4340, "localhost");
+    natsMutex_Lock(arg.m);
+    while ((s != NATS_TIMEOUT) && !arg.connected)
+        s = natsCondition_TimedWait(arg.c, arg.m, 5000);
+    natsMutex_Unlock(arg.m);
+    testCond((s == NATS_OK) && _srvConnectedTo(nc, "nats://localhost:4340"));
+
+    test("Buffered message was sent: ");
+    s = natsConnection_FlushTimeout(nc, 2000);
+    testCond(s == NATS_OK);
+    natsConnection_Destroy(nc);
+    nc = NULL;
+
+    test("Close while the lookups fail: ");
+    _dnsSet(&dns, _DNS_RCODE, 2);
+    arg.connected = false;
+    s = natsConnection_Connect(&nc, opts);
+    if (s == NATS_NOT_YET_CONNECTED)
+    {
+        nats_Sleep(300);
+        natsConnection_Close(nc);
+        s = (natsConnection_IsClosed(nc) ? NATS_OK : NATS_ERR);
+    }
+    testCond(s == NATS_OK);
+    natsConnection_Destroy(nc);
+    nc = NULL;
+    nats_clearLastError();
+
+    natsOptions_Destroy(opts);
+    _stopDNSServer(&dns);
+    _stopServer(pidA);
+    _destroyDefaultThreadArgs(&arg);
+#endif
+}
+
+void test_SRVMaxReconnect(void)
+{
+#if defined(_WIN32)
+    test("Skip when not on Unix: ");
+    testCond(true);
+#else
+    natsStatus          s;
+    _testDNSServer      dns;
+    natsOptions         *opts = NULL;
+    natsConnection      *nc   = NULL;
+    natsPid             pidA  = NATS_INVALID_PID;
+    struct threadArg    arg;
+
+    if (!nats_SupportsSRV())
+    {
+        test("Skip, SRV lookups are not supported on this platform: ");
+        testCond(true);
+        return;
+    }
+
+    s = _createDefaultThreadArgsForCbTests(&arg);
+    if (s != NATS_OK)
+        FAIL("Unable to setup test");
+
+    pidA = _startServer("nats://127.0.0.1:4340", "-p 4340", true);
+    CHECK_SERVER_STARTED(pidA);
+
+    test("Connect: ");
+    s = _startDNSServer(&dns);
+    _dnsSet(&dns, _DNS_ANSWER, 0);
+    _dnsAdd(&dns, 10, 0, 4340, "localhost");
+    IFOK(s, natsOptions_Create(&opts));
+    IFOK(s, natsOptions_SetTimeout(opts, 1000));
+    IFOK(s, natsOptions_SetURL(opts, "nats+srv://localhost"));
+    IFOK(s, natsOptions_SetReconnectWait(opts, 50));
+    IFOK(s, natsOptions_SetMaxReconnect(opts, 2));
+    IFOK(s, natsOptions_SetClosedCB(opts, _closedCb, &arg));
+    IFOK(s, natsConnection_Connect(&nc, opts));
+    testCond(s == NATS_OK);
+
+    test("Target still listed but down: the connection gives up after MaxReconnect: ");
+    _stopServer(pidA);
+    natsMutex_Lock(arg.m);
+    while ((s != NATS_TIMEOUT) && !arg.closed)
+        s = natsCondition_TimedWait(arg.c, arg.m, 5000);
+    natsMutex_Unlock(arg.m);
+    testCond(s == NATS_OK);
+
+    natsConnection_Destroy(nc);
+    natsOptions_Destroy(opts);
+    _stopDNSServer(&dns);
+    _destroyDefaultThreadArgs(&arg);
+#endif
+}
+
+#if !defined(_WIN32)
+// Waits for the connected callback, then returns the number of DNS queries
+// made since `q0` and, in `*elapsed`, the time since `start`.
+static int
+_srvWaitConnected(struct threadArg *arg, _testDNSServer *dns, int q0,
+                  int64_t start, int64_t *elapsed)
+{
+    natsStatus s = NATS_OK;
+
+    natsMutex_Lock(arg->m);
+    while ((s != NATS_TIMEOUT) && !arg->connected)
+        s = natsCondition_TimedWait(arg->c, arg->m, 5000);
+    natsMutex_Unlock(arg->m);
+    *elapsed = nats_Now() - start;
+    return (s == NATS_OK ? _dnsQueries(dns) - q0 : -1);
+}
+#endif
+
+void test_SRVFirstServers(void)
+{
+#if defined(_WIN32)
+    test("Skip when not on Unix: ");
+    testCond(true);
+#else
+    natsStatus          s;
+    _testDNSServer      dns;
+    natsOptions         *opts = NULL;
+    natsConnection      *nc   = NULL;
+    natsPid             pidA  = NATS_INVALID_PID;
+    struct threadArg    arg;
+    const char          *lastErr = NULL;
+    int64_t             start, elapsed = 0;
+    int                 q0, n;
+
+    if (!nats_SupportsSRV())
+    {
+        test("Skip, SRV lookups are not supported on this platform: ");
+        testCond(true);
+        return;
+    }
+
+    s = _createDefaultThreadArgsForCbTests(&arg);
+    if (s != NATS_OK)
+        FAIL("Unable to setup test");
+
+    pidA = _startServer("nats://127.0.0.1:4340", "-p 4340", true);
+    CHECK_SERVER_STARTED(pidA);
+
+    test("Start DNS server: ");
+    s = _startDNSServer(&dns);
+    IFOK(s, natsOptions_Create(&opts));
+    IFOK(s, natsOptions_SetTimeout(opts, 1000));
+    IFOK(s, natsOptions_SetURL(opts, "nats+srv://localhost"));
+    IFOK(s, natsOptions_SetReconnectWait(opts, 500));
+    IFOK(s, natsOptions_SetMaxReconnect(opts, -1));
+    IFOK(s, natsOptions_SetRetryOnFailedConnect(opts, true, _srvConnectedCb, &arg));
+    testCond(s == NATS_OK);
+
+    // The pool starts empty. Once a lookup gives servers, they have not been
+    // tried yet: they are dialed at once, without waiting ReconnectWait and
+    // looking the records up again first.
+    test("Lookups failing: not yet connected: ");
+    _dnsSet(&dns, _DNS_RCODE, 2);
+    _dnsAdd(&dns, 10, 0, 4340, "localhost");
+    s = natsConnection_Connect(&nc, opts);
+    testCond((s == NATS_NOT_YET_CONNECTED) && (nc != NULL));
+    nats_clearLastError();
+
+    test("One target found: dialed after that one lookup: ");
+    nats_Sleep(200);
+    start = nats_Now();
+    q0 = _dnsQueries(&dns);
+    _dnsSetMode(&dns, _DNS_ANSWER);
+    n = _srvWaitConnected(&arg, &dns, q0, start, &elapsed);
+    testCond((n == 1) && (elapsed < 500 + 400)
+             && _srvConnectedTo(nc, "nats://localhost:4340"));
+    natsConnection_Destroy(nc);
+    nc = NULL;
+
+    test("Two targets found, the first one down: both dialed after that one lookup: ");
+    arg.connected = false;
+    _dnsSet(&dns, _DNS_RCODE, 2);
+    _dnsAdd(&dns, 10, 0, 4341, "localhost");
+    _dnsAdd(&dns, 20, 0, 4340, "localhost");
+    s = natsConnection_Connect(&nc, opts);
+    if (s == NATS_NOT_YET_CONNECTED)
+    {
+        nats_clearLastError();
+        nats_Sleep(200);
+        start = nats_Now();
+        q0 = _dnsQueries(&dns);
+        _dnsSetMode(&dns, _DNS_ANSWER);
+        n = _srvWaitConnected(&arg, &dns, q0, start, &elapsed);
+    }
+    testCond((n == 1) && (elapsed < 500 + 400)
+             && _srvConnectedTo(nc, "nats://localhost:4340"));
+    natsConnection_Destroy(nc);
+    nc = NULL;
+
+    // The connection gives up: its last error says why the lookups failed.
+    test("Lookups keep failing: closed after MaxReconnect, last error has the DNS reason: ");
+    arg.connected = false;
+    arg.closed    = false;
+    _dnsSet(&dns, _DNS_RCODE, 2);
+    s = natsOptions_SetMaxReconnect(opts, 2);
+    IFOK(s, natsOptions_SetReconnectWait(opts, 50));
+    IFOK(s, natsOptions_SetClosedCB(opts, _closedCb, &arg));
+    if (s == NATS_OK)
+    {
+        s = natsConnection_Connect(&nc, opts);
+        if (s == NATS_NOT_YET_CONNECTED)
+        {
+            nats_clearLastError();
+            s = NATS_OK;
+        }
+    }
+    natsMutex_Lock(arg.m);
+    while ((s != NATS_TIMEOUT) && !arg.closed)
+        s = natsCondition_TimedWait(arg.c, arg.m, 5000);
+    natsMutex_Unlock(arg.m);
+    if (s == NATS_OK)
+        s = natsConnection_GetLastError(nc, &lastErr);
+    testCond((s == NATS_NO_SERVER) && (lastErr != NULL)
+             && (strstr(lastErr, "_nats._tcp.localhost") != NULL));
+    natsConnection_Destroy(nc);
+    nc = NULL;
+
+    natsOptions_Destroy(opts);
+    _stopDNSServer(&dns);
+    _stopServer(pidA);
+    _destroyDefaultThreadArgs(&arg);
+#endif
 }
 
 void test_SelectNextServer(void)

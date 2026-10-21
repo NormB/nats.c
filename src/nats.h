@@ -2760,6 +2760,27 @@ nats_GetVersion(void);
 NATS_EXTERN uint32_t
 nats_GetVersionNumber(void);
 
+/** \brief Returns `true` if the library can discover servers with DNS SRV records.
+ *
+ * When supported, a server URL of the form `nats+srv://[user[:password]@]domain`
+ * (or `tls+srv://` for TLS) is not dialed directly: the SRV records of
+ * `_nats._tcp.<domain>` are looked up and each target becomes a `nats://`
+ * (or `tls://`) server of the pool. See #natsOptions_SetServers for details.
+ *
+ * The support is built only if the library is configured with
+ * `-DNATS_BUILD_WITH_SRV_LOOKUP=ON` (it is off by default) on a platform
+ * that has the resolver API.
+ *
+ * Applications that load the library dynamically can use this function to
+ * check that the library they loaded supports such URLs: a library without
+ * this function would treat `nats+srv://example.com` as the host
+ * `example.com`.
+ *
+ * @return `true` if `nats+srv://` and `tls+srv://` URLs are supported.
+ */
+NATS_EXTERN bool
+nats_SupportsSRV(void);
+
 #ifdef BUILD_IN_DOXYGEN
 /** \brief Check that the header is compatible with the library.
  *
@@ -3150,6 +3171,7 @@ natsOptions_Create(natsOptions **newOpts);
  * - nats://localhost:4222
  * - nats://user\@localhost:4222
  * - nats://user:password\@localhost:4222
+ * - nats+srv://example.com (see #natsOptions_SetServers)
  *
  * @see natsOptions_SetServers
  * @see natsOptions_SetUserInfo
@@ -3176,6 +3198,35 @@ natsOptions_SetURL(natsOptions *opts, const char *url);
  * This specifies a list of servers to try to connect (or reconnect) to.
  * Note that if you call #natsOptions_SetURL() too, the actual list will contain
  * the one from #natsOptions_SetURL() and the ones specified in this call.
+ *
+ * <b>DNS SRV discovery</b>: where #nats_SupportsSRV() returns `true`, a URL
+ * `nats+srv://[user[:password]\@]domain` (or `tls+srv://` for TLS, which
+ * then makes the connection secure) stands for the servers that the SRV
+ * records of `_nats._tcp.<domain>` list. Such a URL has no port and no path:
+ * the records give the ports. Each target becomes a `nats://` (or `tls://`)
+ * server, with the user info of the URL, in the order RFC 2782 prescribes:
+ * by priority, then by weight (by decreasing weight then target name if
+ * #natsOptions_SetNoRandomize() is set). Static servers are shuffled among
+ * themselves only. Where SRV lookups are not supported, such a URL makes
+ * #natsConnection_Connect() fail with #NATS_NOT_PERMITTED.
+ *
+ * - A target must be the domain or a name in it. If the domain has three
+ * labels or more, a name in its parent domain is accepted too: the records of
+ * `nats.example.com` may point to `n1.example.com`. Other records are
+ * ignored, since DNS answers are not authenticated and the connection sends
+ * its credentials to its servers. Note that with a domain such as
+ * `nats.co.uk`, this accepts any name in `co.uk`.
+ * - The records are looked up again each time all the servers have been
+ * tried without success: new targets are added, targets no longer listed are
+ * removed, and the targets are put back in the order of the new answer. A
+ * failed lookup leaves the servers as they are. A target removed after
+ * #natsOptions_SetMaxReconnect() failed attempts is not added back.
+ * - If the lookups give no server and no other server is configured,
+ * #natsConnection_Connect() fails with #NATS_NO_SERVER, unless
+ * #natsOptions_SetRetryOnFailedConnect() is set: the lookups are then retried,
+ * every reconnect wait, up to the maximum number of reconnect attempts.
+ * - Each lookup waits for at most about the connect timeout
+ * (#natsOptions_SetTimeout()), at least one second per nameserver.
  *
  * @see natsOptions_SetURL
  * @see natsOptions_SetUserInfo
