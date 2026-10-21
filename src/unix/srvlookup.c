@@ -37,7 +37,7 @@ natsSRV_lookup(natsSRVRecord **recs, int *count, const natsSRVSource *src, int64
 }
 
 void
-natsSRV_setTestNameserver(const char *ipv4, int port)
+natsSRV_setTestNameserver(const char *ipv4, int port, int count)
 {
 }
 
@@ -49,12 +49,13 @@ nats_SupportsSRV(void)
 
 #else
 
-static pthread_mutex_t      _testNSMu   = PTHREAD_MUTEX_INITIALIZER;
-static bool                 _testNSSet  = false;
+static pthread_mutex_t      _testNSMu    = PTHREAD_MUTEX_INITIALIZER;
+static bool                 _testNSSet   = false;
+static int                  _testNSCount = 0;
 static struct sockaddr_in   _testNS;
 
 void
-natsSRV_setTestNameserver(const char *ipv4, int port)
+natsSRV_setTestNameserver(const char *ipv4, int port, int count)
 {
     pthread_mutex_lock(&_testNSMu);
     _testNSSet = false;
@@ -63,7 +64,8 @@ natsSRV_setTestNameserver(const char *ipv4, int port)
         memset(&_testNS, 0, sizeof(_testNS));
         _testNS.sin_family = AF_INET;
         _testNS.sin_port   = htons((uint16_t) port);
-        _testNSSet = (inet_pton(AF_INET, ipv4, &(_testNS.sin_addr)) == 1);
+        _testNSSet   = (inet_pton(AF_INET, ipv4, &(_testNS.sin_addr)) == 1);
+        _testNSCount = (count < 1 ? 1 : (count > MAXNS ? MAXNS : count));
     }
     pthread_mutex_unlock(&_testNSMu);
 }
@@ -71,11 +73,19 @@ natsSRV_setTestNameserver(const char *ipv4, int port)
 static void
 _applyTestNameserver(res_state rs)
 {
+    int i;
+
     pthread_mutex_lock(&_testNSMu);
     if (_testNSSet)
     {
-        rs->nsaddr_list[0] = _testNS;
-        rs->nscount        = 1;
+        for (i=0; i<_testNSCount; i++)
+            rs->nsaddr_list[i] = _testNS;
+        rs->nscount = _testNSCount;
+#if defined(RES_USE_EDNS0)
+        // Whatever the system configuration says: the lookup must ask
+        // for EDNS0 itself.
+        rs->options &= ~RES_USE_EDNS0;
+#endif
     }
     pthread_mutex_unlock(&_testNSMu);
 }
@@ -193,13 +203,22 @@ natsSRV_lookup(natsSRVRecord **recs, int *count, const natsSRVSource *src, int64
     if (res_ninit(&rs) != 0)
         return nats_setError(NATS_SYS_ERROR, "SRV lookup of '%s': unable to initialize the resolver", qname);
 
-    // One attempt per nameserver, bounded by the connect timeout.
+    _applyTestNameserver(&rs);
+
+    // One attempt per nameserver, the connect timeout shared among them
+    // (the resolver waits whole seconds, at least one per nameserver).
     rs.retrans = (int)((timeout + 999) / 1000);
+    if (rs.nscount > 1)
+        rs.retrans = (rs.retrans + rs.nscount - 1) / rs.nscount;
     if (rs.retrans < 1)
         rs.retrans = 1;
     rs.retry = 1;
 
-    _applyTestNameserver(&rs);
+#if defined(RES_USE_EDNS0)
+    // Lets an answer larger than 512 bytes come in a UDP reply instead of
+    // being truncated and asked again over TCP, which networks may block.
+    rs.options |= RES_USE_EDNS0;
+#endif
 
     answer = (unsigned char*) NATS_MALLOC(NS_MAXMSG);
     if (answer == NULL)
@@ -216,7 +235,7 @@ natsSRV_lookup(natsSRVRecord **recs, int *count, const natsSRVSource *src, int64
     }
 
     NATS_FREE(answer);
-#if defined(__APPLE__)
+#if defined(NATS_HAS_RES_NDESTROY)
     res_ndestroy(&rs);
 #else
     res_nclose(&rs);

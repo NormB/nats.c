@@ -242,7 +242,7 @@ _cmpDeterministic(const void *a, const void *b)
         return (ra->priority < rb->priority ? -1 : 1);
     if (ra->weight != rb->weight)
         return (ra->weight > rb->weight ? -1 : 1);
-    c = strcmp(ra->target, rb->target);
+    c = strcasecmp(ra->target, rb->target);
     if (c != 0)
         return c;
     if (ra->port != rb->port)

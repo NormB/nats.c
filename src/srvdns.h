@@ -99,9 +99,10 @@ natsSRV_order(natsSRVRecord *recs, int count, bool randomize);
 natsStatus
 natsSRV_buildURL(char **url, const natsSRVSource *src, const natsSRVRecord *rec);
 
-// For tests only: send queries to this IPv4 nameserver (NULL to restore the
-// system configuration).
+// For tests only: send queries to this IPv4 nameserver, listed `count`
+// times (1 to MAXNS), as if the system had that many nameservers (NULL to
+// restore the system configuration).
 void
-natsSRV_setTestNameserver(const char *ipv4, int port);
+natsSRV_setTestNameserver(const char *ipv4, int port, int count);
 
 #endif /* SRVDNS_H_ */

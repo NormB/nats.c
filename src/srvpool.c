@@ -324,6 +324,40 @@ _addSRVTarget(natsSrvPool *pool, int srcIdx, const natsSRVRecord *rec, bool *add
     return NATS_UPDATE_ERR_STACK(s);
 }
 
+// Adds a server that is not an SRV URL, and sets `*idx` to its place. If an
+// SRV lookup already gave the same server, the static one takes the place
+// of the SRV target: the server is in the pool once, and never removed by
+// a later lookup.
+static natsStatus
+_addStaticURL(natsSrvPool *pool, char *url, int *idx)
+{
+    natsStatus  s;
+    natsSrv     *srv;
+    int         i;
+
+    s = _addURLToPool(pool, url, false, NULL);
+    if (s != NATS_OK)
+        return NATS_UPDATE_ERR_STACK(s);
+
+    *idx = pool->size - 1;
+    srv  = pool->srvrs[*idx];
+    for (i=0; i<pool->size - 1; i++)
+    {
+        natsSrv *other = pool->srvrs[i];
+
+        if (other->fromSRV && (other->url->port == srv->url->port)
+            && (strcasecmp(other->url->host, srv->url->host) == 0))
+        {
+            _freeSrv(other);
+            pool->srvrs[i] = srv;
+            pool->size--;
+            *idx = i;
+            break;
+        }
+    }
+    return NATS_OK;
+}
+
 static natsStatus
 _addSRVSource(natsSrvPool *pool, natsSRVSource *src)
 {
@@ -343,21 +377,40 @@ _addSRVSource(natsSrvPool *pool, natsSRVSource *src)
 
 // Adds a server of the options. For an SRV URL, the targets are looked up
 // and added in their RFC 2782 order. A failed lookup is not an error here
-// (see natsSrvPool_Create()): its reason is kept in pool->srvErr.
+// (see natsSrvPool_Create()): its reason is kept in pool->srvErr. Sets
+// `*first` and `*n` to the place and number of the servers added.
 static natsStatus
-_addConfiguredURL(natsSrvPool *pool, char *url, int64_t timeout)
+_addConfiguredURL(natsSrvPool *pool, char *url, int64_t timeout, int *first, int *n)
 {
     natsStatus      s       = NATS_OK;
     natsSRVSource   *src    = NULL;
     natsSRVRecord   *recs   = NULL;
     int             count   = 0;
+    int             prevSize= pool->size;
     int             i;
     bool            isSRV   = false;
     bool            added   = false;
 
+    *first = -1;
+    *n     = 0;
+
     s = natsSRV_parseURL(&src, &isSRV, url);
-    if ((s != NATS_OK) || !isSRV)
-        return (s == NATS_OK ? _addURLToPool(pool, url, false, NULL) : NATS_UPDATE_ERR_STACK(s));
+    if (s != NATS_OK)
+        return NATS_UPDATE_ERR_STACK(s);
+    if (!isSRV)
+    {
+        s = _addStaticURL(pool, url, first);
+        if (s == NATS_OK)
+            *n = 1;
+        return NATS_UPDATE_ERR_STACK(s);
+    }
+    // Looking it up again later would not help.
+    if (!nats_SupportsSRV())
+    {
+        natsSRV_destroySource(src);
+        return nats_setError(NATS_NOT_PERMITTED, "%s",
+                             "SRV URLs (nats+srv://, tls+srv://) are not supported on this platform");
+    }
 
     s = _addSRVSource(pool, src);
     if (s != NATS_OK)
@@ -375,27 +428,38 @@ _addConfiguredURL(natsSrvPool *pool, char *url, int64_t timeout)
 
     natsSRV_destroyRecords(recs, count);
 
+    if (pool->size > prevSize)
+    {
+        *first = prevSize;
+        *n     = pool->size - prevSize;
+    }
     return NATS_UPDATE_ERR_STACK(s);
 }
 
-// Moves the servers [from, pool->size) to the front of the pool.
 static void
-_moveToFront(natsSrvPool *pool, int from)
+_reverse(natsSrv **srvrs, int from, int to)
 {
-    int     n = pool->size - from;
-    natsSrv **tmp;
+    natsSrv *tmp;
 
-    if ((from == 0) || (n <= 0))
+    for (to--; from < to; from++, to--)
+    {
+        tmp         = srvrs[from];
+        srvrs[from] = srvrs[to];
+        srvrs[to]   = tmp;
+    }
+}
+
+// Moves the servers [from, from+n) to the front of the pool, the others
+// keeping their order.
+static void
+_moveToFront(natsSrvPool *pool, int from, int n)
+{
+    if ((from <= 0) || (n <= 0))
         return;
 
-    tmp = (natsSrv**) NATS_MALLOC((size_t) n * sizeof(natsSrv*));
-    if (tmp == NULL)
-        return;
-
-    memcpy(tmp, &pool->srvrs[from], (size_t) n * sizeof(natsSrv*));
-    memmove(&pool->srvrs[n], &pool->srvrs[0], (size_t) from * sizeof(natsSrv*));
-    memcpy(&pool->srvrs[0], tmp, (size_t) n * sizeof(natsSrv*));
-    NATS_FREE(tmp);
+    _reverse(pool->srvrs, 0, from);
+    _reverse(pool->srvrs, from, from + n);
+    _reverse(pool->srvrs, 0, from + n);
 }
 
 natsStatus
@@ -537,6 +601,7 @@ natsSrvPool_Create(natsSrvPool **newPool, natsOptions *opts)
     natsStatus  s        = NATS_OK;
     natsSrvPool *pool    = NULL;
     int         poolSize;
+    int         first, n;
     int         i;
 
     poolSize  = (opts->url != NULL ? 1 : 0);
@@ -566,7 +631,7 @@ natsSrvPool_Create(natsSrvPool **newPool, natsOptions *opts)
 
     // Add URLs from Options' Servers
     for (i=0; (s == NATS_OK) && (i < opts->serversCount); i++)
-        s = _addConfiguredURL(pool, opts->servers[i], opts->timeout);
+        s = _addConfiguredURL(pool, opts->servers[i], opts->timeout, &first, &n);
 
     if (s == NATS_OK)
     {
@@ -579,11 +644,9 @@ natsSrvPool_Create(natsSrvPool **newPool, natsOptions *opts)
     // but we always allowed that, so continue to do so.
     if ((s == NATS_OK) && (opts->url != NULL))
     {
-        int prevSize = pool->size;
-
         // Add to the end of the array
-        s = _addConfiguredURL(pool, opts->url, opts->timeout);
-        if ((s == NATS_OK) && (pool->size > 1) && (pool->size > prevSize))
+        s = _addConfiguredURL(pool, opts->url, opts->timeout, &first, &n);
+        if ((s == NATS_OK) && (pool->size > 1) && (n > 0))
         {
             if (!natsSrvPool_HasSRV(pool))
             {
@@ -597,7 +660,7 @@ natsSrvPool_Create(natsSrvPool **newPool, natsOptions *opts)
             {
                 // Same, without changing the order of the other servers
                 // since SRV targets are ordered.
-                _moveToFront(pool, prevSize);
+                _moveToFront(pool, first, n);
             }
         }
     }
@@ -705,8 +768,9 @@ natsSrvPool_lookupSRV(natsSrvPool *pool, int64_t timeout, natsSRVResult **newRes
     return NATS_OK;
 }
 
-static bool
-_srvListed(natsSRVResult *r, natsSrv *srv)
+// Index of `srv` in the records of `r`, or -1.
+static int
+_srvRank(natsSRVResult *r, natsSrv *srv)
 {
     int i;
 
@@ -715,10 +779,50 @@ _srvListed(natsSRVResult *r, natsSrv *srv)
         if ((r->recs[i].port == srv->url->port)
             && (strcasecmp(r->recs[i].target, srv->url->host) == 0))
         {
-            return true;
+            return i;
         }
     }
-    return false;
+    return -1;
+}
+
+// Puts the servers of the SRV source `k` in the order of its records,
+// within the places they occupy in the pool: the other servers do not
+// move. A server the records do not list (the current one) goes last.
+static void
+_orderSRVTargets(natsSrvPool *pool, int k, natsSRVResult *r)
+{
+    natsSrv *srv;
+    int     i, j, ri, rj;
+    int     *slots;
+    int     n;
+
+    slots = (int*) NATS_MALLOC((size_t) pool->size * sizeof(int));
+    if (slots == NULL)
+        return;
+
+    for (n = 0, i = 0; i < pool->size; i++)
+        if (pool->srvrs[i]->fromSRV && (pool->srvrs[i]->srvSrc == k))
+            slots[n++] = i;
+
+    // Insertion sort by rank: there are a few servers at most.
+    for (i = 1; i < n; i++)
+    {
+        srv = pool->srvrs[slots[i]];
+        ri  = _srvRank(r, srv);
+        if (ri < 0)
+            ri = r->count;
+        for (j = i - 1; j >= 0; j--)
+        {
+            rj = _srvRank(r, pool->srvrs[slots[j]]);
+            if (rj < 0)
+                rj = r->count;
+            if (rj <= ri)
+                break;
+            pool->srvrs[slots[j+1]] = pool->srvrs[slots[j]];
+        }
+        pool->srvrs[slots[j+1]] = srv;
+    }
+    NATS_FREE(slots);
 }
 
 natsStatus
@@ -748,11 +852,16 @@ natsSrvPool_mergeSRV(natsSrvPool *pool, natsSRVResult *results, const natsSrv *c
         for (i=0; i<pool->size; )
         {
             srv = pool->srvrs[i];
-            if (srv->fromSRV && (srv->srvSrc == k) && (srv != cur) && !_srvListed(r, srv))
+            if (srv->fromSRV && (srv->srvSrc == k) && (srv != cur) && (_srvRank(r, srv) < 0))
             {
+                char key[_SRV_KEY_LEN];
+
                 memmove(&pool->srvrs[i], &pool->srvrs[i+1],
                         (size_t)(pool->size - i - 1) * sizeof(natsSrv*));
                 pool->size--;
+                // Forget it, as a server that would not have been known.
+                snprintf(key, sizeof(key), "%s:%d", srv->url->host, srv->url->port);
+                natsStrHash_Remove(pool->urls, key);
                 _freeSrv(srv);
                 *changed = true;
                 continue;
@@ -766,6 +875,8 @@ natsSrvPool_mergeSRV(natsSrvPool *pool, natsSRVResult *results, const natsSrv *c
             if (added)
                 *changed = true;
         }
+        if (s == NATS_OK)
+            _orderSRVTargets(pool, k, r);
     }
 
     return NATS_UPDATE_ERR_STACK(s);

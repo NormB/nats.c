@@ -1771,8 +1771,6 @@ _clearSSL(natsConnection *nc)
     nc->sockCtx.ssl = NULL;
 }
 
-// Try to reconnect using the option parameters.
-// This function assumes we are allowed to reconnect.
 // Looks the SRV records of the server pool up again and merges the answers
 // into the pool. The lookups block, so they run without the connection's
 // lock, which must be held when calling this function. The pool's SRV
@@ -1801,6 +1799,8 @@ _refreshSRV(natsConnection *nc)
     natsSrvPool_freeSRVResults(pool, results);
 }
 
+// Try to reconnect using the option parameters.
+// This function assumes we are allowed to reconnect.
 static void
 _doReconnect(void *arg)
 {
@@ -1892,11 +1892,17 @@ _doReconnect(void *arg)
                 break;
 
             _refreshSRV(nc);
-            if ((natsSrvPool_GetSize(pool) == 0)
-                && (nc->opts->maxReconnect >= 0)
-                && (++srvRounds > nc->opts->maxReconnect))
+            if (natsSrvPool_GetSize(pool) > 0)
+            {
+                // None of these servers has been tried: dial them all
+                // before waiting again.
+                i = -1;
+            }
+            else if ((nc->opts->maxReconnect >= 0)
+                     && (++srvRounds > nc->opts->maxReconnect))
             {
                 nc->err = NATS_NO_SERVER;
+                snprintf(nc->errStr, sizeof(nc->errStr), "%s", pool->srvErr);
                 break;
             }
             continue;

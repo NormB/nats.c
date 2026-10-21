@@ -25,7 +25,7 @@ natsSRV_lookup(natsSRVRecord **recs, int *count, const natsSRVSource *src, int64
 }
 
 void
-natsSRV_setTestNameserver(const char *ipv4, int port)
+natsSRV_setTestNameserver(const char *ipv4, int port, int count)
 {
 }
 
